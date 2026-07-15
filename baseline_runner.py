@@ -2,7 +2,8 @@
 Stage 1 baseline: run the dev questions straight through a bare model with
 NO retrieval, producing an answers file the eval harness can score.
 
-    export OPENAI_API_KEY=...
+    export OPENAI_API_KEY=...  # paste in nebius API key
+    export OPENAI_BASE_URL=https://api.tokenfactory.nebius.com/v1  # Use token factory
     python baseline_runner.py --model deepseek-ai/DeepSeek-V4-Pro
     # then score baseline_answers.jsonl with YOUR evaluation harness (Stage 1)
 
