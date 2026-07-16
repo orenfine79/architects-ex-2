@@ -13,16 +13,20 @@ import os
 import sys
 
 import litellm
+from dotenv import load_dotenv
+
+# Loads the variables from .env into the environment
+load_dotenv() 
 
 BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1")
 # the API doesn't return cost, so we estimate: $/1M tokens (in, out),
 # priced like a stronger model (DeepSeek-class). Real cost may be lower.
 EST_PRICE = (0.5, 2.0)
 
-
 def chat(messages, model, max_tokens=1024, temperature=0.2, quiet=False, **kw):
     """OpenAI-compatible chat completion via litellm; prints a per-call cost estimate."""
-    key = os.environ.get("NEBIUS_API_KEY") or sys.exit("NEBIUS_API_KEY not set")
+    # key = os.environ.get("NEBIUS_API_KEY") or sys.exit("NEBIUS_API_KEY not set")
+    key = os.getenv("NEBIUS_API_KEY") or sys.exit("NEBIUS_API_KEY not set")
     # openai/ prefix: TF model ids contain "/" which litellm would misread as
     # a provider; force the openai-compatible route to BASE_URL instead
     resp = litellm.completion(model=f"openai/{model}", api_base=BASE_URL, api_key=key,
