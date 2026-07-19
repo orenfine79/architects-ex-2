@@ -138,6 +138,84 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR) -
     return docs
 
 
+CHUNKS_FILE = Path("corpus_chunks.jsonl")
+DEFAULT_CHUNK_SIZE = 1500     # chars; ~350-450 tokens of Hebrew, well inside embedding limits
+DEFAULT_CHUNK_OVERLAP = 200   # chars of trailing context carried into the next chunk
+
+
+def _split_oversized(paragraph: str, size: int) -> list[str]:
+    """Cut a paragraph longer than `size` at sentence ends (hard cut as last resort)."""
+    pieces = []
+    while len(paragraph) > size:
+        cut = max(paragraph.rfind(end, 0, size) for end in (". ", "? ", "! ", ".\n", ":\n", "\n"))
+        if cut < size // 2:  # no usable boundary in the back half -- hard cut
+            cut = size - 1
+        pieces.append(paragraph[:cut + 1].strip())
+        paragraph = paragraph[cut + 1:].strip()
+    if paragraph:
+        pieces.append(paragraph)
+    return pieces
+
+
+def chunk_text(text: str, size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
+    """Greedily pack paragraphs into ~size-char chunks; whole trailing paragraphs
+    up to `overlap` chars are repeated at the start of the next chunk so facts
+    straddling a boundary stay retrievable."""
+    units = []
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if para:
+            units.extend(_split_oversized(para, size) if len(para) > size else [para])
+
+    chunks, cur, cur_len = [], [], 0
+    for unit in units:
+        if cur and cur_len + len(unit) > size:
+            chunks.append("\n\n".join(cur))
+            tail, tail_len = [], 0
+            for prev in reversed(cur):  # seed the next chunk with the overlap tail
+                if tail_len + len(prev) > overlap:
+                    break
+                tail.insert(0, prev)
+                tail_len += len(prev)
+            if not tail and overlap:  # trailing paragraph too long -- carry its last sentences
+                t = cur[-1][-overlap:]
+                cut = t.find(". ")
+                t = t[cut + 2:] if 0 <= cut < overlap // 2 else t[t.find(" ") + 1:]
+                tail, tail_len = [t], len(t)
+            cur, cur_len = tail, tail_len
+        cur.append(unit)
+        cur_len += len(unit) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
+                 size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
+    """Chunk parsed docs into vector-DB-ready records and write them to out_path.
+
+    Chunks never cross page boundaries, so every chunk maps to one citable
+    {file, page}. Each record: {"id", "file", "domain", "kind", "url", "page",
+    "chunk_index", "text"}.
+    """
+    chunks = []
+    for doc in docs:
+        for page in doc["pages"]:
+            for j, text in enumerate(chunk_text(page["text"], size, overlap)):
+                chunks.append({"id": f"{doc['file']}#p{page['page']}.{j}",
+                               "file": doc["file"], "domain": doc["domain"],
+                               "kind": doc["kind"], "url": doc.get("url"),
+                               "page": page["page"], "chunk_index": j,
+                               "text": text})
+    with open(out_path, "w", encoding="utf-8") as f:
+        for c in chunks:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
+    sizes = sorted(len(c["text"]) for c in chunks)
+    print(f"chunked {len(docs)} docs -> {len(chunks)} chunks -> {out_path} "
+          f"(chars/chunk: median {sizes[len(sizes) // 2]}, max {sizes[-1]})")
+    return chunks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="reference_questions.json")
@@ -150,14 +228,21 @@ def main():
                     help="where to write per-item eval results (with --eval)")
     ap.add_argument("--parse-corpus", action="store_true",
                     help="parse the corpus into parsed_corpus/ and exit")
+    ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
+                    help="target chunk size in characters")
+    ap.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP,
+                    help="characters of trailing context repeated in the next chunk")
     args = ap.parse_args()
 
+    # loads from parsed_corpus/ cache; parses (docling) anything missing
+    docs = parse_corpus()
+    n_pages = sum(len(d["pages"]) for d in docs)
+    print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
     if args.parse_corpus:
-        docs = parse_corpus()
-        n_pages = sum(len(d["pages"]) for d in docs)
-        print(f"\n{len(docs)} documents / {n_pages} pages parsed -> {PARSED_DIR}/")
+        return
 
-    # TODO: Chunk parsed corpus.
+    chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
+    return
 
     # TODO: Embed chunks and insert into vector database.
 
