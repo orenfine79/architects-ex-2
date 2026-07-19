@@ -16,6 +16,7 @@ how the failure profile (not just the score) changes.
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -336,6 +337,48 @@ def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K) -> list[dic
                                        res["distances"][0])]
 
 
+def build_rag_prompt(question: str, hits: list[dict]) -> str:
+    """User message: numbered source chunks + the question + citation protocol."""
+    sources = "\n\n---\n\n".join(
+        f"[{i}] file: {h['file']} | page: {h['page']}\n{h['text']}"
+        for i, h in enumerate(hits, 1))
+    return f"""Below are excerpts from official Harel insurance documents, followed by a customer question.
+
+SOURCES:
+{sources}
+
+---
+
+QUESTION: {question}
+
+INSTRUCTIONS:
+- Answer based ONLY on the sources above; do not use outside knowledge.
+- If the sources do not contain enough information to answer, say you do not have the exact information.
+- End your reply with one final line listing the numbers of the sources that support your answer, exactly in this format: CITED: 1,3
+- If no source supports the answer, end with: CITED: none"""
+
+
+_CITED_RE = re.compile(r"CITED:\s*(none|[\d,\s]+)\s*$", re.IGNORECASE)
+
+
+def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[dict]]:
+    """Split the CITED: trailer off the model reply and resolve the numbers to
+    {file, page} citations (page is null for web pages, per the contract)."""
+    m = _CITED_RE.search(answer.strip())
+    if not m:
+        return answer.strip(), []
+    citations, seen = [], set()
+    for tok in re.findall(r"\d+", m.group(1)):
+        i = int(tok) - 1
+        if 0 <= i < len(hits):
+            h = hits[i]
+            page = h["page"] if h["kind"] == "pdf" else None
+            if (h["file"], page) not in seen:
+                seen.add((h["file"], page))
+                citations.append({"file": h["file"], "page": page})
+    return answer.strip()[:m.start()].rstrip(), citations
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="reference_questions.json")
@@ -394,14 +437,14 @@ def main():
         for q, q_vec in zip(questions, q_vecs):
             t0 = time.time()
             hits = query_top_k(collection, q_vec, k=args.top_k)
-            # TODO: build the model prompt from the retrieved chunks and cite them
             resp = litellm.completion(model=model, messages=[
                 {"role": "system", "content": args.system_prompt},
-                {"role": "user", "content": q["question"]}],
+                {"role": "user", "content": build_rag_prompt(q["question"], hits)}],
                 timeout=120, **kwargs)
+            answer, citations = extract_citations(resp.choices[0].message.content, hits)
             rec = {"id": q["id"],
-                   "answer": resp.choices[0].message.content,
-                   "citations": [],
+                   "answer": answer,
+                   "citations": citations,
                    "retrieved": [{"file": h["file"], "page": h["page"],
                                   "score": round(h["score"], 3)} for h in hits],
                    "latency_ms": (time.time() - t0) * 1000,
