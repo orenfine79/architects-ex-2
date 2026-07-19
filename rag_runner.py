@@ -216,7 +216,8 @@ def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
     return chunks
 
 
-EMBEDDINGS_FILE = Path("chunk_embeddings.npz")
+CHUNK_EMBEDDINGS_FILE = Path("chunk_embeddings.npz")
+QUESTION_EMBEDDINGS_FILE = Path("question_embeddings.npz")
 DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"  # strong multilingual/Hebrew retriever
 DEFAULT_BATCH_SIZE = 32
 
@@ -241,45 +242,60 @@ def embed_texts(embedder, model_name: str, texts: list[str], kind: str = "passag
                            show_progress_bar=len(texts) > batch_size)
 
 
-def _chunks_fingerprint(model_name: str, chunks: list[dict]) -> str:
+def _embedding_fingerprint(model_name: str, kind: str, items: list[tuple[str, str]]) -> str:
     """Hash of everything the embeddings depend on: model, prefix convention,
-    and every chunk id and text. Changing any of them invalidates caches."""
+    and every (id, text) pair. Changing any of them invalidates caches."""
     import hashlib
 
     h = hashlib.sha256(model_name.encode())
-    h.update(_e5_prefix(model_name, "passage").encode())
-    for c in chunks:
-        h.update(c["id"].encode())
-        h.update(c["text"].encode())
+    h.update(_e5_prefix(model_name, kind).encode())
+    for id_, text in items:
+        h.update(id_.encode())
+        h.update(text.encode())
     return h.hexdigest()
 
 
-def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
-                 out_path: Path = EMBEDDINGS_FILE, batch_size: int = DEFAULT_BATCH_SIZE):
-    """Embed chunk texts, cached in out_path. The cache is keyed by
-    _chunks_fingerprint, so changing the chunking parameters or the model
-    re-embeds automatically."""
+def _embed_cached(items: list[tuple[str, str]], kind: str, out_path: Path, label: str,
+                  model_name: str = DEFAULT_EMBED_MODEL,
+                  batch_size: int = DEFAULT_BATCH_SIZE):
+    """Embed (id, text) items, cached in out_path keyed by _embedding_fingerprint."""
     import numpy as np
 
-    fingerprint = _chunks_fingerprint(model_name, chunks)
+    fingerprint = _embedding_fingerprint(model_name, kind, items)
 
     if out_path.exists():
         cached = np.load(out_path)
         if str(cached["fingerprint"]) == fingerprint:
-            print(f"embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
+            print(f"{label} embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
             return cached["embeddings"]
 
-    print(f"embedding {len(chunks)} chunks with {model_name} ...")
+    print(f"embedding {len(items)} {label}s with {model_name} ...")
     t0 = time.time()
     embedder = _load_embedder(model_name)
-    embeddings = embed_texts(embedder, model_name, [c["text"] for c in chunks],
-                             kind="passage", batch_size=batch_size)
+    embeddings = embed_texts(embedder, model_name, [text for _, text in items],
+                             kind=kind, batch_size=batch_size)
     np.savez_compressed(out_path, embeddings=embeddings,
-                        ids=np.array([c["id"] for c in chunks]),
+                        ids=np.array([id_ for id_, _ in items]),
                         fingerprint=np.array(fingerprint))
-    print(f"embedded {len(chunks)} chunks -> {out_path} "
+    print(f"embedded {len(items)} {label}s -> {out_path} "
           f"(shape {embeddings.shape}, {time.time() - t0:.0f}s)")
     return embeddings
+
+
+def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+                 out_path: Path = CHUNK_EMBEDDINGS_FILE,
+                 batch_size: int = DEFAULT_BATCH_SIZE):
+    return _embed_cached([(c["id"], c["text"]) for c in chunks], kind="passage",
+                         out_path=out_path, label="chunk",
+                         model_name=model_name, batch_size=batch_size)
+
+
+def embed_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+                    out_path: Path = QUESTION_EMBEDDINGS_FILE,
+                    batch_size: int = DEFAULT_BATCH_SIZE):
+    return _embed_cached([(q["id"], q["question"]) for q in questions], kind="query",
+                         out_path=out_path, label="question",
+                         model_name=model_name, batch_size=batch_size)
 
 
 CHROMA_COLLECTION = "harel_corpus"
@@ -309,6 +325,17 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
     return collection
 
 
+DEFAULT_TOP_K = 5
+
+
+def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K) -> list[dict]:
+    """Return the k nearest chunks as dicts: metadata + text + cosine score."""
+    res = collection.query(query_embeddings=[query_embedding], n_results=k)
+    return [{**meta, "text": doc, "score": 1 - dist}
+            for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
+                                       res["distances"][0])]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="reference_questions.json")
@@ -329,6 +356,8 @@ def main():
                     help="sentence-transformers model for chunk/query embeddings")
     ap.add_argument("--embed-batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                     help="encode batch size for embedding")
+    ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
+                    help="number of chunks to retrieve per question")
     args = ap.parse_args()
 
     # loads from parsed_corpus/ cache; parses (docling) anything missing
@@ -342,9 +371,6 @@ def main():
     embeddings = embed_chunks(chunks, model_name=args.embed_model,
                               batch_size=args.embed_batch_size)
     collection = build_vector_db(chunks, embeddings)
-    return
-
-    # TODO: Embed questions and query vector database to find top-k answers.
 
     # routing: OPENAI_BASE_URL forces the openai/ route to that endpoint,
     # whatever the model id looks like (TF ids contain "/")
@@ -359,22 +385,31 @@ def main():
     questions = json.load(open(args.questions, encoding="utf-8"))
     if isinstance(questions, dict):  # staff sets wrap the list in {"questions": [...]}
         questions = questions["questions"]
+
+    # embed all questions (cached on disk), then query the db per question
+    q_vecs = embed_questions(questions, model_name=args.embed_model,
+                             batch_size=args.embed_batch_size)
+
     with open(args.out, "w", encoding="utf-8") as out:
-        for q in questions:
+        for q, q_vec in zip(questions, q_vecs):
             t0 = time.time()
+            hits = query_top_k(collection, q_vec, k=args.top_k)
+            # TODO: build the model prompt from the retrieved chunks and cite them
             resp = litellm.completion(model=model, messages=[
                 {"role": "system", "content": args.system_prompt},
                 {"role": "user", "content": q["question"]}],
                 timeout=120, **kwargs)
             rec = {"id": q["id"],
                    "answer": resp.choices[0].message.content,
-                   "citations": [],  # the model has no documents -- that's the point
+                   "citations": [],
+                   "retrieved": [{"file": h["file"], "page": h["page"],
+                                  "score": round(h["score"], 3)} for h in hits],
                    "latency_ms": (time.time() - t0) * 1000,
                    "tokens": {"prompt": resp.usage.prompt_tokens,
                               "completion": resp.usage.completion_tokens}}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            print(f"{q['id']}: {rec['answer'][:70]!r}... ({rec['latency_ms']:.0f} ms)")
-    
+            print(f"{q['id']}: {rec['answer'][:70]!r}... ({rec['latency_ms']:.0f} ms; "
+                  f"top hit {hits[0]['file']} p{hits[0]['page']} @{hits[0]['score']:.2f})")
     
     print(f"\nwrote {args.out} -- now score it with your evaluation harness")
 
