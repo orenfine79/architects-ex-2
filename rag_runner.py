@@ -216,6 +216,66 @@ def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
     return chunks
 
 
+EMBEDDINGS_FILE = Path("chunk_embeddings.npz")
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"  # strong multilingual/Hebrew retriever
+DEFAULT_BATCH_SIZE = 32
+
+
+def _load_embedder(model_name: str):
+    # imported lazily: sentence-transformers pulls in torch
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_name)
+
+
+def _e5_prefix(model_name: str, kind: str) -> str:
+    # E5-family models are trained with "query: " / "passage: " prefixes;
+    # skipping them costs real retrieval quality
+    return f"{kind}: " if "e5" in model_name.lower() else ""
+
+
+def embed_texts(embedder, model_name: str, texts: list[str], kind: str = "passage",
+                batch_size: int = DEFAULT_BATCH_SIZE):
+    prefix = _e5_prefix(model_name, kind)
+    return embedder.encode([prefix + t for t in texts], batch_size=batch_size,
+                           normalize_embeddings=True,  # unit vectors: cosine == dot product
+                           show_progress_bar=len(texts) > batch_size)
+
+
+def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+                 out_path: Path = EMBEDDINGS_FILE, batch_size: int = DEFAULT_BATCH_SIZE):
+    """Embed chunk texts, cached in out_path. The cache is keyed by a hash of
+    the model name + every chunk id and text, so changing the chunking
+    parameters or the model re-embeds automatically."""
+    import hashlib
+
+    import numpy as np
+
+    h = hashlib.sha256(model_name.encode())
+    h.update(_e5_prefix(model_name, "passage").encode())  # prefix change must invalidate the cache
+    for c in chunks:
+        h.update(c["id"].encode())
+        h.update(c["text"].encode())
+    fingerprint = h.hexdigest()
+
+    if out_path.exists():
+        cached = np.load(out_path)
+        if str(cached["fingerprint"]) == fingerprint:
+            print(f"embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
+            return cached["embeddings"]
+
+    print(f"embedding {len(chunks)} chunks with {model_name} ...")
+    t0 = time.time()
+    embedder = _load_embedder(model_name)
+    embeddings = embed_texts(embedder, model_name, [c["text"] for c in chunks],
+                             kind="passage", batch_size=batch_size)
+    np.savez_compressed(out_path, embeddings=embeddings,
+                        ids=np.array([c["id"] for c in chunks]),
+                        fingerprint=np.array(fingerprint))
+    print(f"embedded {len(chunks)} chunks -> {out_path} "
+          f"(shape {embeddings.shape}, {time.time() - t0:.0f}s)")
+    return embeddings
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="reference_questions.json")
@@ -232,6 +292,10 @@ def main():
                     help="target chunk size in characters")
     ap.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP,
                     help="characters of trailing context repeated in the next chunk")
+    ap.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL,
+                    help="sentence-transformers model for chunk/query embeddings")
+    ap.add_argument("--embed-batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                    help="encode batch size for embedding")
     args = ap.parse_args()
 
     # loads from parsed_corpus/ cache; parses (docling) anything missing
@@ -242,9 +306,11 @@ def main():
         return
 
     chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
+    embeddings = embed_chunks(chunks, model_name=args.embed_model,
+                              batch_size=args.embed_batch_size)
     return
 
-    # TODO: Embed chunks and insert into vector database.
+    # TODO: Insert embedded chunks into vector database.
 
     # TODO: Embed questions and query vector database to find top-k answers.
 

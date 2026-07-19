@@ -6,4 +6,5 @@ __pycache__/
 archive/
 *.jsonl
 report.txt
+chunk_embeddings.npz
 
