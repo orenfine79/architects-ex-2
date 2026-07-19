@@ -97,8 +97,10 @@ def parse_page_txt(path: Path) -> list[dict]:
     return [{"page": 1, "text": path.read_text(encoding="utf-8")}]
 
 
-def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR) -> list[dict]:
-    """Parse (or load from cache) every corpus document. Returns the parsed docs."""
+def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
+                 force: bool = False) -> list[dict]:
+    """Parse (or load from cache) every corpus document. Returns the parsed docs.
+    With force=True, cached results are ignored and every document is re-parsed."""
     manifest_file = corpus_dir / "manifest.json"
     manifest = (json.loads(manifest_file.read_text(encoding="utf-8"))
                 if manifest_file.exists() else {})
@@ -109,7 +111,7 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR) -
     for i, src in enumerate(sources, 1):
         rel = src.relative_to(corpus_dir).as_posix()
         cache = parsed_dir / f"{rel}.json"
-        if cache.exists():
+        if cache.exists() and not force:
             rec = json.loads(cache.read_text(encoding="utf-8"))
         else:
             t0 = time.time()
@@ -258,13 +260,14 @@ def _embedding_fingerprint(model_name: str, kind: str, items: list[tuple[str, st
 
 def _embed_cached(items: list[tuple[str, str]], kind: str, out_path: Path, label: str,
                   model_name: str = DEFAULT_EMBED_MODEL,
-                  batch_size: int = DEFAULT_BATCH_SIZE):
-    """Embed (id, text) items, cached in out_path keyed by _embedding_fingerprint."""
+                  batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+    """Embed (id, text) items, cached in out_path keyed by _embedding_fingerprint.
+    With force=True, the cache is ignored and everything is re-embedded."""
     import numpy as np
 
     fingerprint = _embedding_fingerprint(model_name, kind, items)
 
-    if out_path.exists():
+    if out_path.exists() and not force:
         cached = np.load(out_path)
         if str(cached["fingerprint"]) == fingerprint:
             print(f"{label} embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
@@ -285,18 +288,18 @@ def _embed_cached(items: list[tuple[str, str]], kind: str, out_path: Path, label
 
 def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
                  out_path: Path = CHUNK_EMBEDDINGS_FILE,
-                 batch_size: int = DEFAULT_BATCH_SIZE):
+                 batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
     return _embed_cached([(c["id"], c["text"]) for c in chunks], kind="passage",
                          out_path=out_path, label="chunk",
-                         model_name=model_name, batch_size=batch_size)
+                         model_name=model_name, batch_size=batch_size, force=force)
 
 
 def embed_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
                     out_path: Path = QUESTION_EMBEDDINGS_FILE,
-                    batch_size: int = DEFAULT_BATCH_SIZE):
+                    batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
     return _embed_cached([(q["id"], q["question"]) for q in questions], kind="query",
                          out_path=out_path, label="question",
-                         model_name=model_name, batch_size=batch_size)
+                         model_name=model_name, batch_size=batch_size, force=force)
 
 
 CHROMA_COLLECTION = "harel_corpus"
@@ -401,10 +404,13 @@ def main():
                     help="encode batch size for embedding")
     ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
                     help="number of chunks to retrieve per question")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore cached files: re-parse the corpus "
+                         "and re-embed chunks and questions")
     args = ap.parse_args()
 
     # loads from parsed_corpus/ cache; parses (docling) anything missing
-    docs = parse_corpus()
+    docs = parse_corpus(force=args.force)
     n_pages = sum(len(d["pages"]) for d in docs)
     print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
     if args.parse_corpus:
@@ -412,7 +418,7 @@ def main():
 
     chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
     embeddings = embed_chunks(chunks, model_name=args.embed_model,
-                              batch_size=args.embed_batch_size)
+                              batch_size=args.embed_batch_size, force=args.force)
     collection = build_vector_db(chunks, embeddings)
 
     # routing: OPENAI_BASE_URL forces the openai/ route to that endpoint,
@@ -431,7 +437,7 @@ def main():
 
     # embed all questions (cached on disk), then query the db per question
     q_vecs = embed_questions(questions, model_name=args.embed_model,
-                             batch_size=args.embed_batch_size)
+                             batch_size=args.embed_batch_size, force=args.force)
 
     with open(args.out, "w", encoding="utf-8") as out:
         for q, q_vec in zip(questions, q_vecs):
