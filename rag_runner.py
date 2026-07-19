@@ -241,21 +241,27 @@ def embed_texts(embedder, model_name: str, texts: list[str], kind: str = "passag
                            show_progress_bar=len(texts) > batch_size)
 
 
-def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
-                 out_path: Path = EMBEDDINGS_FILE, batch_size: int = DEFAULT_BATCH_SIZE):
-    """Embed chunk texts, cached in out_path. The cache is keyed by a hash of
-    the model name + every chunk id and text, so changing the chunking
-    parameters or the model re-embeds automatically."""
+def _chunks_fingerprint(model_name: str, chunks: list[dict]) -> str:
+    """Hash of everything the embeddings depend on: model, prefix convention,
+    and every chunk id and text. Changing any of them invalidates caches."""
     import hashlib
 
-    import numpy as np
-
     h = hashlib.sha256(model_name.encode())
-    h.update(_e5_prefix(model_name, "passage").encode())  # prefix change must invalidate the cache
+    h.update(_e5_prefix(model_name, "passage").encode())
     for c in chunks:
         h.update(c["id"].encode())
         h.update(c["text"].encode())
-    fingerprint = h.hexdigest()
+    return h.hexdigest()
+
+
+def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+                 out_path: Path = EMBEDDINGS_FILE, batch_size: int = DEFAULT_BATCH_SIZE):
+    """Embed chunk texts, cached in out_path. The cache is keyed by
+    _chunks_fingerprint, so changing the chunking parameters or the model
+    re-embeds automatically."""
+    import numpy as np
+
+    fingerprint = _chunks_fingerprint(model_name, chunks)
 
     if out_path.exists():
         cached = np.load(out_path)
@@ -274,6 +280,33 @@ def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
     print(f"embedded {len(chunks)} chunks -> {out_path} "
           f"(shape {embeddings.shape}, {time.time() - t0:.0f}s)")
     return embeddings
+
+
+CHROMA_COLLECTION = "harel_corpus"
+
+
+def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTION):
+    """Insert chunks + precomputed embeddings into an in-memory chromadb
+    collection, rebuilt on every run (the embeddings themselves stay cached
+    on disk, so this only costs a few seconds)."""
+    import chromadb
+
+    t0 = time.time()
+    client = chromadb.EphemeralClient()
+    collection = client.create_collection(name, metadata={"hnsw:space": "cosine"})
+    batch_size = 2048
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        collection.add(ids=[c["id"] for c in batch],
+                embeddings=embeddings[i:i + batch_size],
+                documents=[c["text"] for c in batch],
+                metadatas=[{"file": c["file"], "page": c["page"],
+                            "domain": c["domain"], "kind": c["kind"],
+                            "url": c.get("url") or "", "chunk_index": c["chunk_index"]}
+                           for c in batch])
+    print(f"vector db: inserted {collection.count()} chunks into in-memory collection "
+          f"'{name}' ({time.time() - t0:.0f}s)")
+    return collection
 
 
 def main():
@@ -308,9 +341,8 @@ def main():
     chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
     embeddings = embed_chunks(chunks, model_name=args.embed_model,
                               batch_size=args.embed_batch_size)
+    collection = build_vector_db(chunks, embeddings)
     return
-
-    # TODO: Insert embedded chunks into vector database.
 
     # TODO: Embed questions and query vector database to find top-k answers.
 
