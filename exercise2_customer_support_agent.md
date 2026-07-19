@@ -40,7 +40,7 @@ You will:
 2. **Build an evaluation harness** — It must score a batch of answers against the dev set's ground truths and report at least:
    - **Answer relevance** — does the answer agree with the ground-truth answer on the asked fact? Use an LLM-as-judge (a Token Factory model works); force structured JSON output and pin the judge model so runs are comparable.
    - **Hallucination rate** — confident answers that *contradict* the ground truth. Decide how your judge treats refusals ("I don't know" is not a hallucination — a system that knows what it doesn't know is worth measuring).
-   - **Citation accuracy** — did the system cite the right file and page? Each fact in `ground_truth_sources` lists one or more *acceptable* sources (an `any_of` group of `{file, page}`) — the same fact often appears in several corpus documents, and citing **any one** of a group's sources earns full credit; cross-document questions have two groups and require citing a source from **both**. This metric needs no LLM. (For the bare baseline, expect ~zero — the model has nothing to cite.)
+   - **Citation accuracy** — does the cited evidence actually establish the answer? Resolve each cited `{file, page}` to the actual corpus page and use an LLM judge to decide whether the cited pages establish the **ground-truth answer** (fully / partially / not at all). The same fact often appears in several corpus documents — *any* page that truly establishes it earns credit; there is no fixed list of "correct" sources to match against. The `ground_truth_sources` in `reference_questions.json` show where each answer was authored from — useful for debugging your retrieval, but not the scoring target. A citation pointing at a nonexistent file or page counts against you. (For the bare baseline, expect ~zero — the model has nothing to cite.)
    - **Latency** per question.
    Your final grade uses our internal harness (same criteria, plus conversational quality and efficiency), so a harness that tracks these honestly is your compass for the whole exercise. Wire it into your loop from day one.
 3. Experiment with at least two prompt strategies (e.g. "answer only if certain", "always cite your source", few-shot-prompting) and observe how the failure profile shifts.
@@ -116,7 +116,7 @@ You are competing against: the **bare-LLM baseline**, the other APEX teams, and 
 
 **How submission works:** on submission day you receive `blind_questions.json` — the hidden blind set, questions only. You run the provided `submit_runner.py` on your own machine: it asks your local `/ask` endpoint every question, measures latency, and writes one answers JSONL. You send us that file; we score it with our internal harness. At final presentations we re-ask a few blind questions against your live system — the answers should match your submission.
 
-**How you'll be judged:** answer relevance against the ground-truth answers (LLM-as-judge), citation accuracy (file + page), efficiency (latency and cost), and conversational quality — the same criteria your Stage 1 harness tracks, so your dev-set numbers should roughly predict your blind-set numbers.
+**How you'll be judged:** answer relevance against the ground-truth answers (LLM-as-judge), citation accuracy (LLM-as-judge: do the pages you cite establish the ground-truth answer?), efficiency (latency and cost), and conversational quality — the same criteria your Stage 1 harness tracks, so your dev-set numbers should roughly predict your blind-set numbers.
 
 ---
 
@@ -135,7 +135,7 @@ You are competing against: the **bare-LLM baseline**, the other APEX teams, and 
 | File | What it is |
 |---|---|
 | `get_corpus.py` | Downloads the corpus: ~570 Harel documents (PDFs + web pages), all 12 domains |
-| `reference_questions.json` | Dev Q&A set: questions labeled easy/medium/hard, ground-truth answers + file/page citations |
+| `reference_questions.json` | Dev Q&A set: questions labeled easy/medium/hard, ground-truth answers + reference file/page pointers (where each answer was authored from — for debugging retrieval, not the scoring target) |
 | `contract.py` | The FastAPI request/response schema your system must expose |
 | `baseline_runner.py` | Stage 1 baseline: questions → bare model → answers JSONL |
 | `submit_runner.py` | Batch-asks your `/ask` endpoint and writes the answers JSONL — the exact script used for final submission |
