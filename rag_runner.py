@@ -1,11 +1,10 @@
 """
-Stage 2 RAG: run the dev questions straight through a bare model with
-NO retrieval, producing an answers file the eval harness can score.
+Stage 2 RAG: run the dev questions straight through a bare model WITH
+retrieval, producing an answers file the eval harness can score.
 
-    export OPENAI_API_KEY=...  # paste in nebius API key
-    export OPENAI_BASE_URL=https://api.tokenfactory.nebius.com/v1  # Use token factory
-    python baseline_runner.py --model deepseek-ai/DeepSeek-V4-Pro
-    # then score baseline_answers.jsonl with YOUR evaluation harness (Stage 1)
+    # set OPENAI_BASE_URL and OPENAI_API_KEY in .env file
+    uv run rag_runner.py
+    # then score rag_answers.jsonl with YOUR evaluation harness (Stage 2)
 
 Calls go through litellm: a bare model name goes to OpenAI; set
 OPENAI_BASE_URL for any OpenAI-compatible endpoint (Token Factory, a local
@@ -387,7 +386,7 @@ def main():
     ap.add_argument("--questions", default="reference_questions.json")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--system-prompt", default=V4_SYSTEM)
-    ap.add_argument("--out", default="baseline_answers.jsonl")
+    ap.add_argument("--out", default="rag_answers.jsonl")
     ap.add_argument("--eval", action="store_true",
                     help="after generating answers, score them with the eval harness")
     ap.add_argument("--eval-out", default="evaluation.jsonl",
