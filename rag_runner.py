@@ -329,14 +329,66 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
 
 
 DEFAULT_TOP_K = 5
+DEFAULT_EXPAND = 1
 
 
-def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K) -> list[dict]:
-    """Return the k nearest chunks as dicts: metadata + text + cosine score."""
+def _merge_adjacent(left: str, right: str) -> str:
+    """Join two consecutive chunks, dropping the overlap tail that chunking
+    repeated at the start of the right one."""
+    for n in range(min(len(left), len(right)), 0, -1):
+        if left.endswith(right[:n]):
+            return left + right[n:]
+    return left + "\n\n" + right
+
+
+def expand_hits(collection, hits: list[dict], radius: int) -> list[dict]:
+    """Widen each hit's text with up to `radius` neighbouring chunks on each
+    side. Neighbours never cross a page boundary (chunk ids encode the page),
+    so every hit still maps to one citable {file, page}. Chunks that are hits
+    themselves, or already claimed by a higher-ranked hit, are not repeated."""
+    def chunk_id(h: dict, j: int) -> str:
+        return f"{h['file']}#p{h['page']}.{j}"
+
+    used = {chunk_id(h, h["chunk_index"]) for h in hits}
+    wanted = []
+    for h in hits:
+        for j in range(max(h["chunk_index"] - radius, 0), h["chunk_index"] + radius + 1):
+            cid = chunk_id(h, j)
+            if cid not in used and cid not in wanted:
+                wanted.append(cid)
+    if not wanted:
+        return hits
+    got = collection.get(ids=wanted)  # ids past the end of a page just come back missing
+    neighbours = dict(zip(got["ids"], got["documents"]))
+
+    for h in hits:  # score order, so better hits claim shared neighbours first
+        parts = [h["text"]]
+        for j in range(h["chunk_index"] - 1, h["chunk_index"] - radius - 1, -1):
+            text = neighbours.pop(chunk_id(h, j), None)
+            if text is None:
+                break
+            parts.insert(0, text)
+        for j in range(h["chunk_index"] + 1, h["chunk_index"] + radius + 1):
+            text = neighbours.pop(chunk_id(h, j), None)
+            if text is None:
+                break
+            parts.append(text)
+        text = parts[0]
+        for part in parts[1:]:
+            text = _merge_adjacent(text, part)
+        h["text"] = text
+    return hits
+
+
+def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K,
+                expand: int = DEFAULT_EXPAND) -> list[dict]:
+    """Return the k nearest chunks as dicts: metadata + text + cosine score,
+    each expanded with `expand` neighbouring chunks on either side."""
     res = collection.query(query_embeddings=[query_embedding], n_results=k)
-    return [{**meta, "text": doc, "score": 1 - dist}
+    hits = [{**meta, "text": doc, "score": 1 - dist}
             for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
                                        res["distances"][0])]
+    return expand_hits(collection, hits, expand) if expand > 0 else hits
 
 
 def build_rag_prompt(question: str, hits: list[dict]) -> str:
@@ -403,6 +455,9 @@ def main():
                     help="encode batch size for embedding")
     ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
                     help="number of chunks to retrieve per question")
+    ap.add_argument("--expand", type=int, default=DEFAULT_EXPAND,
+                    help="neighbouring chunks to merge into each hit on either side "
+                         "(0 disables expansion)")
     ap.add_argument("--force", action="store_true",
                     help="ignore cached files: re-parse the corpus "
                          "and re-embed chunks and questions")
@@ -441,7 +496,7 @@ def main():
     with open(args.out, "w", encoding="utf-8") as out:
         for q, q_vec in zip(questions, q_vecs):
             t0 = time.time()
-            hits = query_top_k(collection, q_vec, k=args.top_k)
+            hits = query_top_k(collection, q_vec, k=args.top_k, expand=args.expand)
             resp = litellm.completion(model=model, messages=[
                 {"role": "system", "content": args.system_prompt},
                 {"role": "user", "content": build_rag_prompt(q["question"], hits)}],
