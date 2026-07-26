@@ -5,4 +5,5 @@ __pycache__/
 .venv/
 archive/
 *.jsonl
+!chunks.jsonl
 report.txt
