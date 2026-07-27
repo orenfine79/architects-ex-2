@@ -328,8 +328,8 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
     return collection
 
 
-DEFAULT_TOP_K = 5
-DEFAULT_EXPAND = 1
+DEFAULT_TOP_K = 10
+DEFAULT_EXPAND = 2
 
 
 def _merge_adjacent(left: str, right: str) -> str:
