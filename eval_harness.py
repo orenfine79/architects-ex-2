@@ -1,4 +1,6 @@
 import argparse, json, os, re, time
+from functools import lru_cache
+from pathlib import Path
 from dotenv import load_dotenv
 from tf_client import chat
 import pandas as pd
@@ -56,6 +58,30 @@ Example:
 """
 
 MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+
+PARSED_DIR = Path("parsed_corpus")
+
+CITATION_JUDGE_SYSTEM_PROMPT = """
+You are verifying whether a cited source passage actually backs up a generated
+answer -- i.e. that the citation is not fabricated or irrelevant. You are given
+the Question, the Generated Answer (produced by an AI, which cited this source),
+and the Cited Passage (the exact text of the page the answer cited).
+
+Decide whether the Cited Passage contains the information needed to support the
+claims made in the Generated Answer. It does NOT need to state the answer
+verbatim -- it is enough that the facts in the passage back up what the answer
+claims. Answer false if the passage is irrelevant or does not contain the
+information the generated answer relies on.
+
+Return ONLY a single valid JSON object (no markdown fences, no comments, no text
+before or after) with exactly these keys:
+- "reasoning": string. Brief justification on one line, no double quotes inside.
+- "supported": boolean. true if the passage supports the Generated Answer,
+  false if it is irrelevant or does not contain the needed information.
+
+Example:
+{"reasoning": "The passage states filing with an institution does not stop the limitation period, which is exactly what the generated answer claims.", "supported": true}
+"""
 
 
 def run_evaluation(questions, answers, out="evaluation.jsonl",
@@ -135,7 +161,7 @@ def main():
     ap.add_argument("--questions", default="reference_questions.json")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--system-prompt", default=EVAL_SYSTEM_PROMPT)
-    ap.add_argument("--answers", default="baseline_answers_v2.jsonl")
+    ap.add_argument("--answers", default="baseline_answers_v4.jsonl")
     ap.add_argument("--out", default="evaluation.jsonl")
     args = ap.parse_args()
 
@@ -219,7 +245,12 @@ def eval_harness(id, question, generated_answer, ground_truth_answer, generated_
             answer_eval = parse_eval_json(reply)
             answer_score = answer_eval["similarity_score"]
             
-            citation_eval = evaluate_citations(generated_citations, ground_truth_citations)
+            citation_eval = evaluate_citations(
+                question=question,
+                generated_answer=generated_answer,
+                candidate_citations=generated_citations,
+                model=model,
+            )
             citation_score = citation_eval["score"]
             
             return {
@@ -262,63 +293,127 @@ def normalize_page(page):
         return str(page).strip()
 
 
-def check_source_match(candidate, expected) -> bool:
-    """Checks if a single candidate citation matches an expected ground truth source."""
-    cand_file = normalize_path(candidate.get("file"))
-    exp_file = normalize_path(expected.get("file"))
+@lru_cache(maxsize=None)
+def _load_parsed_doc(file: str):
+    """Loads a parsed corpus document (list of {page, text}) for a citation file.
 
-    cand_page = normalize_page(candidate.get("page"))
-    exp_page = normalize_page(expected.get("page"))
-
-    return cand_file == exp_file and cand_page == exp_page
-
-
-def evaluate_citations(candidate_citations, ground_truth_sources) -> dict:
-    """Evaluates if the candidate's citations satisfy the ground truth requirements.
-
-    Handles:
-      - Single-document questions (1 group)
-      - Cross-document questions (multiple groups, requiring one match per group)
-      - 'any_of' conditional matches within each group
+    Cached because the same document is cited many times across a run. Returns
+    the 'pages' list, or None if the parsed file is missing/unreadable.
     """
+    rel = normalize_path(file)
+    path = PARSED_DIR / f"{rel}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.load(open(path, encoding="utf-8")).get("pages", [])
+    except (json.JSONDecodeError, OSError):
+        return None
 
-    total_groups = len(ground_truth_sources)
-    group_results = []
-    
-    # Each 'group' represents a distinct fact/document requirement
-    for idx, group in enumerate(ground_truth_sources):
-        any_of_list = group.get("any_of", [])
-        group_satisfied = False
-        matched_by = None
 
-        # Check if ANY of the acceptable sources for this group are cited
-        for expected_source in any_of_list:
-            for candidate_cite in candidate_citations:
-                if check_source_match(candidate_cite, expected_source):
-                    group_satisfied = True
-                    matched_by = candidate_cite
-                    break
-            if group_satisfied:
-                break
+def load_citation_text(file, page) -> str:
+    """Returns the text of the cited page from the parsed corpus.
 
-        group_results.append(
-            {
-                "group_index": idx,
-                "satisfied": group_satisfied,
-                "matched_with": matched_by,
-                "options": any_of_list,
-            }
-        )
+    `page` is matched leniently ('32', 32, 32.0 all match). When page is None
+    (e.g. a web source parsed as a single page), all pages are concatenated.
+    Returns "" if the document or page can't be found.
+    """
+    pages = _load_parsed_doc(file)
+    if not pages:
+        return ""
 
-    # Calculate overall score
-    satisfied_count = sum(1 for g in group_results if g["satisfied"])
-    score = satisfied_count / total_groups if total_groups > 0 else 1.0
+    want = normalize_page(page)
+    if want is None:
+        return "\n\n".join(p.get("text", "") for p in pages).strip()
+
+    for p in pages:
+        if normalize_page(p.get("page")) == want:
+            return (p.get("text") or "").strip()
+    return ""
+
+
+def parse_citation_json(reply: str) -> dict:
+    """Parses the citation judge's JSON reply into {reasoning, supported}."""
+    text = reply.strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+
+    try:
+        obj = json.loads(text)
+        return {"reasoning": str(obj.get("reasoning", "")),
+                "supported": bool(obj.get("supported", False))}
+    except json.JSONDecodeError:
+        pass
+
+    m = re.search(r'"supported"\s*:\s*(true|false)', text)
+    reason = re.search(r'"reasoning"\s*:\s*"(.*?)"', text, re.DOTALL)
+    return {
+        "reasoning": reason.group(1) if reason else "",
+        "supported": m is not None and m.group(1) == "true",
+    }
+
+
+def judge_citation(question, generated_answer, citation_text,
+                   model=MODEL, system_prompt=CITATION_JUDGE_SYSTEM_PROMPT) -> dict:
+    """Asks the LLM judge whether one cited passage supports the generated answer."""
+    user_message = f"""
+    [Inputs]
+    Question: {question}
+    Generated Answer: {generated_answer}
+    Cited Passage: {citation_text}
+    """
+    reply = chat(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        model=model,
+        temperature=0,
+        quiet=True,
+    )
+    return parse_citation_json(reply)
+
+
+def evaluate_citations(question, generated_answer, candidate_citations,
+                       model=MODEL, system_prompt=CITATION_JUDGE_SYSTEM_PROMPT) -> dict:
+    """LLM-as-judge citation check.
+
+    For each generated citation, fetches the cited page text from the parsed
+    corpus and asks the judge whether that passage actually supports the
+    generated answer (i.e. the citation is grounded, not fabricated). Scoring
+    is binary: 1.0 if at least one citation is supporting, else 0.0 (and 0.0
+    when there are no citations at all).
+    """
+    details = []
+    for cite in candidate_citations:
+        file = cite.get("file")
+        page = cite.get("page")
+        text = load_citation_text(file, page)
+
+        if not text:  # can't locate the cited page -> it can't support anything
+            details.append({"file": file, "page": page, "supported": False,
+                            "reasoning": "cited page not found in parsed corpus",
+                            "text_found": False})
+            continue
+
+        verdict = judge_citation(question, generated_answer, text,
+                                 model=model, system_prompt=system_prompt)
+        details.append({"file": file, "page": page,
+                        "supported": verdict["supported"],
+                        "reasoning": verdict["reasoning"],
+                        "text_found": True})
+
+    supported_count = sum(1 for d in details if d["supported"])
+    score = 1.0 if supported_count > 0 else 0.0
 
     return {
-        "is_fully_correct": satisfied_count == total_groups,
-        "score": score,  # Fraction of required facts cited
-        "satisfied_groups_count": f"{satisfied_count}/{total_groups}",
-        "details": group_results,
+        "is_fully_correct": score == 1.0,
+        "score": score,  # binary: any citation supports the answer?
+        "supported_citations_count": f"{supported_count}/{len(candidate_citations)}",
+        "details": details,
     }
 
 

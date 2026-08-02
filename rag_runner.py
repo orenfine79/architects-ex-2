@@ -113,6 +113,8 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
         if cache.exists() and not force:
             rec = json.loads(cache.read_text(encoding="utf-8"))
         else:
+            continue # After cleaning the parsed+corpus, we don't want to parse 
+                      # the documents again
             t0 = time.time()
             try:
                 if src.suffix == ".pdf":
@@ -301,6 +303,27 @@ def embed_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL
                          model_name=model_name, batch_size=batch_size, force=force)
 
 
+ENRICHED_QUESTIONS_FILE = Path("enriched_questions.jsonl")
+ENRICHED_Q_EMBEDDINGS_FILE = Path("enriched_question_embeddings.npz")
+
+
+def load_enriched_questions(path: Path = ENRICHED_QUESTIONS_FILE) -> list[dict]:
+    """Load the per-chunk synthetic questions (one JSON object per line):
+    {"question_id", "chunk_id", "question_text"}."""
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def embed_enriched_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+                             out_path: Path = ENRICHED_Q_EMBEDDINGS_FILE,
+                             batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+    # kind="query": these are questions matched against real user questions, so
+    # they carry the same E5 "query: " prefix (symmetric question-to-question match)
+    return _embed_cached([(q["question_id"], q["question_text"]) for q in questions],
+                         kind="query", out_path=out_path, label="enriched question",
+                         model_name=model_name, batch_size=batch_size, force=force)
+
+
 CHROMA_COLLECTION = "harel_corpus"
 
 
@@ -319,7 +342,7 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
         collection.add(ids=[c["id"] for c in batch],
                 embeddings=embeddings[i:i + batch_size],
                 documents=[c["text"] for c in batch],
-                metadatas=[{"file": c["file"], "page": c["page"],
+                metadatas=[{"type": "chunk", "file": c["file"], "page": c["page"],
                             "domain": c["domain"], "kind": c["kind"],
                             "url": c.get("url") or "", "chunk_index": c["chunk_index"]}
                            for c in batch])
@@ -328,8 +351,30 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
     return collection
 
 
+def add_questions_to_db(collection, questions: list[dict], embeddings):
+    """Insert enriched questions + their embeddings into the existing collection.
+
+    Each question record carries type="question" and the chunk_id it was
+    generated from, so a question that wins a query can be resolved back to its
+    source chunk (metadata["chunk_id"]) for text and citation."""
+    t0 = time.time()
+    batch_size = 2048
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i + batch_size]
+        collection.add(ids=[q["question_id"] for q in batch],
+                embeddings=embeddings[i:i + batch_size],
+                documents=[q["question_text"] for q in batch],
+                metadatas=[{"type": "question", "chunk_id": q["chunk_id"]} for q in batch])
+    print(f"vector db: inserted {len(questions)} enriched questions -> collection now "
+          f"holds {collection.count()} records ({time.time() - t0:.0f}s)")
+    return collection
+
+
 DEFAULT_TOP_K = 10
 DEFAULT_EXPAND = 2
+# the collection is mostly enriched questions, and many map to the same chunk,
+# so we fetch this many candidates per requested chunk before dedup-to-k
+QUESTION_POOL_FACTOR = 10
 
 
 def _merge_adjacent(left: str, right: str) -> str:
@@ -380,14 +425,56 @@ def expand_hits(collection, hits: list[dict], radius: int) -> list[dict]:
     return hits
 
 
+def _resolve_to_chunks(collection, raw_hits: list[dict], k: int) -> list[dict]:
+    """Turn a mixed pool of raw query hits into up to k distinct chunk hits.
+
+    A "question" hit resolves to its source chunk (via chunk_id), inheriting the
+    question's cosine score; a "chunk" hit maps to itself. Hits stay in query
+    rank order, and duplicates (several questions pointing at one chunk, or a
+    chunk that is also a direct hit) collapse to their first, best-ranked
+    occurrence. Every returned hit carries the chunk fields the rest of the
+    pipeline expects (file, page, kind, chunk_index, text)."""
+    # fetch the bodies+metadata of the chunks that question hits point at
+    q_chunk_ids = list(dict.fromkeys(
+        h["chunk_id"] for h in raw_hits if h.get("type") == "question"))
+    chunks = {}
+    if q_chunk_ids:
+        got = collection.get(ids=q_chunk_ids)  # ids with no chunk come back missing
+        chunks = dict(zip(got["ids"], zip(got["documents"], got["metadatas"])))
+
+    hits, seen = [], set()
+    for h in raw_hits:
+        if h.get("type") == "question":
+            resolved = chunks.get(h["chunk_id"])
+            if resolved is None:  # chunk_id not in the current chunking -- skip
+                continue
+            doc, meta = resolved
+            hit = {**meta, "text": doc, "score": h["score"]}
+        else:
+            hit = h
+        key = (hit["file"], hit["page"], hit["chunk_index"])
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append(hit)
+        if len(hits) == k:
+            break
+    return hits
+
+
 def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K,
                 expand: int = DEFAULT_EXPAND) -> list[dict]:
     """Return the k nearest chunks as dicts: metadata + text + cosine score,
-    each expanded with `expand` neighbouring chunks on either side."""
-    res = collection.query(query_embeddings=[query_embedding], n_results=k)
-    hits = [{**meta, "text": doc, "score": 1 - dist}
-            for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
-                                       res["distances"][0])]
+    each expanded with `expand` neighbouring chunks on either side.
+
+    The collection holds both chunks and enriched questions; a matched question
+    resolves to its source chunk, so callers always see chunk-shaped hits."""
+    pool = max(k * QUESTION_POOL_FACTOR, k)
+    res = collection.query(query_embeddings=[query_embedding], n_results=pool)
+    raw = [{**meta, "text": doc, "score": 1 - dist}
+           for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
+                                      res["distances"][0])]
+    hits = _resolve_to_chunks(collection, raw, k)
     return expand_hits(collection, hits, expand) if expand > 0 else hits
 
 
@@ -445,6 +532,8 @@ def main():
                     help="where to write per-item eval results (with --eval)")
     ap.add_argument("--parse-corpus", action="store_true",
                     help="parse the corpus into parsed_corpus/ and exit")
+    ap.add_argument("--chunk-corpus", action="store_true",
+                    help="chunk the corpus into corpus_chunks.jsonl and exit")
     ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                     help="target chunk size in characters")
     ap.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP,
@@ -471,9 +560,20 @@ def main():
         return
 
     chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
+    if args.chunk_corpus:
+        return
+    
     embeddings = embed_chunks(chunks, model_name=args.embed_model,
                               batch_size=args.embed_batch_size, force=args.force)
     collection = build_vector_db(chunks, embeddings)
+
+    # index the per-chunk synthetic questions alongside the chunks: a real user
+    # question can match a pre-generated question, which resolves to its chunk
+    enriched = load_enriched_questions()
+    print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
+    enriched_vecs = embed_enriched_questions(enriched, model_name=args.embed_model,
+                                             batch_size=args.embed_batch_size, force=args.force)
+    add_questions_to_db(collection, enriched, enriched_vecs)
 
     # routing: OPENAI_BASE_URL forces the openai/ route to that endpoint,
     # whatever the model id looks like (TF ids contain "/")
@@ -519,7 +619,6 @@ def main():
     if args.eval:
         print("\nscoring answers with the eval harness ...")
         run_evaluation(questions, args.out, args.eval_out)
-
 
 if __name__ == "__main__":
     main()

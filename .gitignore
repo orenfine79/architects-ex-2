@@ -6,4 +6,6 @@ __pycache__/
 archive/
 *.jsonl
 !chunks.jsonl
+*.npz
 report.txt
+.DS_Store
