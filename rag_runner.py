@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import litellm
@@ -142,6 +143,21 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
     return docs
 
 
+@dataclass(frozen=True)
+class Chunk:
+    """One vector-DB-ready piece of a parsed page. Chunks never cross page
+    boundaries, so each maps to one citable {file, page}; id encodes that
+    plus the position: "<file>#p<page>.<chunk_index>"."""
+    id: str
+    file: str
+    domain: str
+    kind: str          # source type: "pdf" or "txt"
+    url: str | None    # source URL from the corpus manifest, if any
+    page: int
+    chunk_index: int
+    text: str
+
+
 CHUNKS_FILE = Path("corpus_chunks.jsonl")
 DEFAULT_CHUNK_SIZE = 1500     # chars; ~350-450 tokens of Hebrew, well inside embedding limits
 DEFAULT_CHUNK_OVERLAP = 200   # chars of trailing context carried into the next chunk
@@ -195,33 +211,28 @@ def chunk_text(text: str, size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT
 
 
 def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
-                 size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[dict]:
-    """Chunk parsed docs into vector-DB-ready records and write them to out_path.
-
-    Chunks never cross page boundaries, so every chunk maps to one citable
-    {file, page}. Each record: {"id", "file", "domain", "kind", "url", "page",
-    "chunk_index", "text"}.
-    """
+                 size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[Chunk]:
+    """Chunk parsed docs into vector-DB-ready Chunks and write them to out_path
+    (one JSON object per line, same fields as the dataclass)."""
     chunks = []
     for doc in docs:
         for page in doc["pages"]:
             for j, text in enumerate(chunk_text(page["text"], size, overlap)):
-                chunks.append({"id": f"{doc['file']}#p{page['page']}.{j}",
-                               "file": doc["file"], "domain": doc["domain"],
-                               "kind": doc["kind"], "url": doc.get("url"),
-                               "page": page["page"], "chunk_index": j,
-                               "text": text})
+                chunks.append(Chunk(id=f"{doc['file']}#p{page['page']}.{j}",
+                                    file=doc["file"], domain=doc["domain"],
+                                    kind=doc["kind"], url=doc.get("url"),
+                                    page=page["page"], chunk_index=j,
+                                    text=text))
     with open(out_path, "w", encoding="utf-8") as f:
         for c in chunks:
-            f.write(json.dumps(c, ensure_ascii=False) + "\n")
-    sizes = sorted(len(c["text"]) for c in chunks)
+            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+    sizes = sorted(len(c.text) for c in chunks)
     print(f"chunked {len(docs)} docs -> {len(chunks)} chunks -> {out_path} "
           f"(chars/chunk: median {sizes[len(sizes) // 2]}, max {sizes[-1]})")
     return chunks
 
 
 CHUNK_EMBEDDINGS_FILE = Path("chunk_embeddings.npz")
-QUESTION_EMBEDDINGS_FILE = Path("question_embeddings.npz")
 DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"  # strong multilingual/Hebrew retriever
 DEFAULT_BATCH_SIZE = 32
 
@@ -287,19 +298,11 @@ def _embed_cached(items: list[tuple[str, str]], kind: str, out_path: Path, label
     return embeddings
 
 
-def embed_chunks(chunks: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+def embed_chunks(chunks: list[Chunk], model_name: str = DEFAULT_EMBED_MODEL,
                  out_path: Path = CHUNK_EMBEDDINGS_FILE,
                  batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
-    return _embed_cached([(c["id"], c["text"]) for c in chunks], kind="passage",
+    return _embed_cached([(c.id, c.text) for c in chunks], kind="passage",
                          out_path=out_path, label="chunk",
-                         model_name=model_name, batch_size=batch_size, force=force)
-
-
-def embed_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
-                    out_path: Path = QUESTION_EMBEDDINGS_FILE,
-                    batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
-    return _embed_cached([(q["id"], q["question"]) for q in questions], kind="query",
-                         out_path=out_path, label="question",
                          model_name=model_name, batch_size=batch_size, force=force)
 
 
@@ -307,19 +310,28 @@ ENRICHED_QUESTIONS_FILE = Path("enriched_questions.jsonl")
 ENRICHED_Q_EMBEDDINGS_FILE = Path("enriched_question_embeddings.npz")
 
 
-def load_enriched_questions(path: Path = ENRICHED_QUESTIONS_FILE) -> list[dict]:
-    """Load the per-chunk synthetic questions (one JSON object per line):
-    {"question_id", "chunk_id", "question_text"}."""
+@dataclass(frozen=True)
+class EnrichedQuestion:
+    """A synthetic question generated from one chunk (by enrich.py); matching
+    it at query time resolves back to that source chunk."""
+    question_id: str   # "<chunk_id>#q<j>"
+    chunk_id: str
+    question_text: str
+
+
+def load_enriched_questions(path: Path = ENRICHED_QUESTIONS_FILE) -> list[EnrichedQuestion]:
+    """Load the per-chunk synthetic questions (one JSON object per line)."""
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        return [EnrichedQuestion(**json.loads(line)) for line in f if line.strip()]
 
 
-def embed_enriched_questions(questions: list[dict], model_name: str = DEFAULT_EMBED_MODEL,
+def embed_enriched_questions(questions: list[EnrichedQuestion],
+                             model_name: str = DEFAULT_EMBED_MODEL,
                              out_path: Path = ENRICHED_Q_EMBEDDINGS_FILE,
                              batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
     # kind="query": these are questions matched against real user questions, so
     # they carry the same E5 "query: " prefix (symmetric question-to-question match)
-    return _embed_cached([(q["question_id"], q["question_text"]) for q in questions],
+    return _embed_cached([(q.question_id, q.question_text) for q in questions],
                          kind="query", out_path=out_path, label="enriched question",
                          model_name=model_name, batch_size=batch_size, force=force)
 
@@ -327,7 +339,7 @@ def embed_enriched_questions(questions: list[dict], model_name: str = DEFAULT_EM
 CHROMA_COLLECTION = "harel_corpus"
 
 
-def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTION):
+def build_vector_db(chunks: list[Chunk], embeddings, name: str = CHROMA_COLLECTION):
     """Insert chunks + precomputed embeddings into an in-memory chromadb
     collection, rebuilt on every run (the embeddings themselves stay cached
     on disk, so this only costs a few seconds)."""
@@ -339,19 +351,19 @@ def build_vector_db(chunks: list[dict], embeddings, name: str = CHROMA_COLLECTIO
     batch_size = 2048
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        collection.add(ids=[c["id"] for c in batch],
+        collection.add(ids=[c.id for c in batch],
                 embeddings=embeddings[i:i + batch_size],
-                documents=[c["text"] for c in batch],
-                metadatas=[{"type": "chunk", "file": c["file"], "page": c["page"],
-                            "domain": c["domain"], "kind": c["kind"],
-                            "url": c.get("url") or "", "chunk_index": c["chunk_index"]}
+                documents=[c.text for c in batch],
+                metadatas=[{"type": "chunk", "file": c.file, "page": c.page,
+                            "domain": c.domain, "kind": c.kind,
+                            "url": c.url or "", "chunk_index": c.chunk_index}
                            for c in batch])
     print(f"vector db: inserted {collection.count()} chunks into in-memory collection "
           f"'{name}' ({time.time() - t0:.0f}s)")
     return collection
 
 
-def add_questions_to_db(collection, questions: list[dict], embeddings):
+def add_questions_to_db(collection, questions: list[EnrichedQuestion], embeddings):
     """Insert enriched questions + their embeddings into the existing collection.
 
     Each question record carries type="question" and the chunk_id it was
@@ -361,10 +373,10 @@ def add_questions_to_db(collection, questions: list[dict], embeddings):
     batch_size = 2048
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
-        collection.add(ids=[q["question_id"] for q in batch],
+        collection.add(ids=[q.question_id for q in batch],
                 embeddings=embeddings[i:i + batch_size],
-                documents=[q["question_text"] for q in batch],
-                metadatas=[{"type": "question", "chunk_id": q["chunk_id"]} for q in batch])
+                documents=[q.question_text for q in batch],
+                metadatas=[{"type": "question", "chunk_id": q.chunk_id} for q in batch])
     print(f"vector db: inserted {len(questions)} enriched questions -> collection now "
           f"holds {collection.count()} records ({time.time() - t0:.0f}s)")
     return collection
@@ -502,9 +514,16 @@ INSTRUCTIONS:
 _CITED_RE = re.compile(r"CITED:\s*(none|[\d,\s]+)\s*$", re.IGNORECASE)
 
 
-def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[dict]]:
+@dataclass(frozen=True)
+class SourceRef:
+    """A citable source location; page is None for web-page sources."""
+    file: str
+    page: int | None
+
+
+def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[SourceRef]]:
     """Split the CITED: trailer off the model reply and resolve the numbers to
-    {file, page} citations (page is null for web pages, per the contract)."""
+    SourceRef citations."""
     m = _CITED_RE.search(answer.strip())
     if not m:
         return answer.strip(), []
@@ -513,11 +532,113 @@ def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[dict]]:
         i = int(tok) - 1
         if 0 <= i < len(hits):
             h = hits[i]
-            page = h["page"] if h["kind"] == "pdf" else None
-            if (h["file"], page) not in seen:
-                seen.add((h["file"], page))
-                citations.append({"file": h["file"], "page": page})
+            ref = SourceRef(file=h["file"],
+                            page=h["page"] if h["kind"] == "pdf" else None)
+            if ref not in seen:
+                seen.add(ref)
+                citations.append(ref)
     return answer.strip()[:m.start()].rstrip(), citations
+
+
+def resolve_model(model: str = MODEL) -> tuple[str, dict]:
+    """Map a model name to a litellm (model, extra-kwargs) pair.
+
+    OPENAI_BASE_URL forces the openai/ route to that endpoint, whatever the
+    model id looks like (TF ids contain "/"); otherwise a bare name goes to
+    OpenAI and provider-prefixed names ("anthropic/...") pass through."""
+    kwargs = {}
+    base = os.getenv("OPENAI_BASE_URL")
+    if base:
+        kwargs["api_base"] = base
+        model = f"openai/{model.removeprefix('openai/')}"
+    elif "/" not in model:
+        model = f"openai/{model}"
+    return model, kwargs
+
+
+def build_pipeline(chunk_size: int = DEFAULT_CHUNK_SIZE,
+                   chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+                   embed_model: str = DEFAULT_EMBED_MODEL,
+                   batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+    """Build the full retrieval stack -- parse -> chunk -> embed -> vector db
+    with enriched questions -- and return the queryable collection. Parsing,
+    chunking and embeddings are disk-cached, so a warm build takes seconds."""
+    docs = parse_corpus(force=force)
+    n_pages = sum(len(d["pages"]) for d in docs)
+    print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
+
+    chunks = chunk_corpus(docs, size=chunk_size, overlap=chunk_overlap)
+    embeddings = embed_chunks(chunks, model_name=embed_model,
+                              batch_size=batch_size, force=force)
+    collection = build_vector_db(chunks, embeddings)
+
+    # index the per-chunk synthetic questions alongside the chunks: a real user
+    # question can match a pre-generated question, which resolves to its chunk
+    if ENRICHED_QUESTIONS_FILE.exists():
+        enriched = load_enriched_questions()
+        print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
+        enriched_vecs = embed_enriched_questions(enriched, model_name=embed_model,
+                                                 batch_size=batch_size, force=force)
+        add_questions_to_db(collection, enriched, enriched_vecs)
+    else:
+        print(f"WARNING: {ENRICHED_QUESTIONS_FILE} not found -- retrieval runs on "
+              f"chunks only (generate it with enrich.py)")
+    return collection
+
+
+@dataclass(frozen=True)
+class AnswerResult:
+    """One answered question, as yielded by answer_questions."""
+    answer: str
+    citations: list[SourceRef]
+    hits: list[dict]   # chunk-shaped retrieval hits (see query_top_k)
+    response: object   # raw litellm response, for token/cost accounting
+    latency_ms: float  # retrieval + generation (batch embedding is amortized)
+
+
+def answer_questions(collection, embedder, questions: list[str], *,
+                     model: str = MODEL, system_prompt: str = V4_SYSTEM,
+                     embed_model: str = DEFAULT_EMBED_MODEL,
+                     batch_size: int = DEFAULT_BATCH_SIZE,
+                     k: int = DEFAULT_TOP_K, expand: int = DEFAULT_EXPAND):
+    """Answer live questions: the whole batch is embedded in one encoder pass,
+    then each question is retrieved -> generated -> cited in turn. Yields one
+    AnswerResult per question in input order, lazily, so callers can stream
+    results to disk as they arrive."""
+    llm_model, kwargs = resolve_model(model)
+    q_vecs = embed_texts(embedder, embed_model, questions, kind="query",
+                         batch_size=batch_size)
+    for question, q_vec in zip(questions, q_vecs):
+        t0 = time.time()
+        hits = query_top_k(collection, q_vec, k=k, expand=expand)
+        resp = litellm.completion(model=llm_model, messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": build_rag_prompt(question, hits)}],
+            timeout=120, **kwargs)
+        answer, citations = extract_citations(resp.choices[0].message.content, hits)
+        yield AnswerResult(answer=answer, citations=citations, hits=hits,
+                           response=resp, latency_ms=(time.time() - t0) * 1000)
+
+
+@dataclass(frozen=True)
+class Service:
+    """Serving state built once by init_service."""
+    collection: object  # chromadb collection over chunks + enriched questions
+    embedder: object    # SentenceTransformer that embeds live queries
+    embed_model: str    # its model name (drives the E5 query prefix)
+
+
+_service: Service | None = None
+
+
+def init_service(embed_model: str = DEFAULT_EMBED_MODEL) -> Service:
+    """Build the retrieval stack and load the query embedder once (idempotent)."""
+    global _service
+    if _service is None:
+        _service = Service(collection=build_pipeline(embed_model=embed_model),
+                           embedder=_load_embedder(embed_model),
+                           embed_model=embed_model)
+    return _service
 
 
 def main():
@@ -549,69 +670,47 @@ def main():
                          "(0 disables expansion)")
     ap.add_argument("--force", action="store_true",
                     help="ignore cached files: re-parse the corpus "
-                         "and re-embed chunks and questions")
+                         "and re-embed chunks and enriched questions")
     args = ap.parse_args()
 
-    # loads from parsed_corpus/ cache; parses (docling) anything missing
-    docs = parse_corpus(force=args.force)
-    n_pages = sum(len(d["pages"]) for d in docs)
-    print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
-    if args.parse_corpus:
+    if args.parse_corpus or args.chunk_corpus:
+        # loads from parsed_corpus/ cache; parses (docling) anything missing
+        docs = parse_corpus(force=args.force)
+        n_pages = sum(len(d["pages"]) for d in docs)
+        print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
+        if args.chunk_corpus:
+            chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
         return
 
-    chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
-    if args.chunk_corpus:
-        return
-    
-    embeddings = embed_chunks(chunks, model_name=args.embed_model,
-                              batch_size=args.embed_batch_size, force=args.force)
-    collection = build_vector_db(chunks, embeddings)
-
-    # index the per-chunk synthetic questions alongside the chunks: a real user
-    # question can match a pre-generated question, which resolves to its chunk
-    enriched = load_enriched_questions()
-    print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
-    enriched_vecs = embed_enriched_questions(enriched, model_name=args.embed_model,
-                                             batch_size=args.embed_batch_size, force=args.force)
-    add_questions_to_db(collection, enriched, enriched_vecs)
-
-    # routing: OPENAI_BASE_URL forces the openai/ route to that endpoint,
-    # whatever the model id looks like (TF ids contain "/")
-    model, kwargs = args.model, {}
-    base = os.getenv("OPENAI_BASE_URL")
-    if base:
-        kwargs["api_base"] = base
-        model = f"openai/{model.removeprefix('openai/')}"
-    elif "/" not in model:
-        model = f"openai/{model}"
+    collection = build_pipeline(chunk_size=args.chunk_size,
+                                chunk_overlap=args.chunk_overlap,
+                                embed_model=args.embed_model,
+                                batch_size=args.embed_batch_size, force=args.force)
+    embedder = _load_embedder(args.embed_model)
 
     questions = json.load(open(args.questions, encoding="utf-8"))
     if isinstance(questions, dict):  # staff sets wrap the list in {"questions": [...]}
         questions = questions["questions"]
 
-    # embed all questions (cached on disk), then query the db per question
-    q_vecs = embed_questions(questions, model_name=args.embed_model,
-                             batch_size=args.embed_batch_size, force=args.force)
-
+    results = answer_questions(collection, embedder,
+                               [item["question"] for item in questions],
+                               model=args.model, system_prompt=args.system_prompt,
+                               embed_model=args.embed_model,
+                               batch_size=args.embed_batch_size,
+                               k=args.top_k, expand=args.expand)
     with open(args.out, "w", encoding="utf-8") as out:
-        for q, q_vec in zip(questions, q_vecs):
-            t0 = time.time()
-            hits = query_top_k(collection, q_vec, k=args.top_k, expand=args.expand)
-            resp = litellm.completion(model=model, messages=[
-                {"role": "system", "content": args.system_prompt},
-                {"role": "user", "content": build_rag_prompt(q["question"], hits)}],
-                timeout=120, **kwargs)
-            answer, citations = extract_citations(resp.choices[0].message.content, hits)
+        for q, result in zip(questions, results):
+            hits, resp = result.hits, result.response
             rec = {"id": q["id"],
-                   "answer": answer,
-                   "citations": citations,
+                   "answer": result.answer,
+                   "citations": [asdict(c) for c in result.citations],
                    "retrieved": [{"file": h["file"], "page": h["page"],
                                   "score": round(h["score"], 3)} for h in hits],
-                   "latency_ms": (time.time() - t0) * 1000,
+                   "latency_ms": result.latency_ms,
                    "tokens": {"prompt": resp.usage.prompt_tokens,
                               "completion": resp.usage.completion_tokens}}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            print(f"{q['id']}: {rec['answer'][:70]!r}... ({rec['latency_ms']:.0f} ms; "
+            print(f"{q['id']}: {result.answer[:70]!r}... ({result.latency_ms:.0f} ms; "
                   f"top hit {hits[0]['file']} p{hits[0]['page']} @{hits[0]['score']:.2f})")
     
     print(f"\nwrote {args.out} -- now score it with your evaluation harness")
