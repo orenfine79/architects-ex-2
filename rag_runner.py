@@ -17,8 +17,9 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import ClassVar, Self
 
 import litellm
 from dotenv import load_dotenv
@@ -93,14 +94,19 @@ def parse_pdf(converter, path: Path) -> list[dict]:
     return pages
 
 
-def parse_page_txt(path: Path) -> list[dict]:
+def parse_txt(path: Path) -> list[dict]:
     return [{"page": 1, "text": path.read_text(encoding="utf-8")}]
 
 
 def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
                  force: bool = False) -> list[dict]:
-    """Parse (or load from cache) every corpus document. Returns the parsed docs.
-    With force=True, cached results are ignored and every document is re-parsed."""
+    """Load every corpus document from the parsed_dir cache. Returns the docs.
+
+    parsed_dir is hand-curated (clean_data.py strips boilerplate and deletes
+    non-Hebrew docs), so by default a missing cache file means the document was
+    deliberately removed and is skipped -- never re-parsed. force=True re-parses
+    everything from the raw corpus, undoing that curation: re-run clean_data.py
+    (boilerplate strip + --delete-non-hebrew --apply) afterwards."""
     manifest_file = corpus_dir / "manifest.json"
     manifest = (json.loads(manifest_file.read_text(encoding="utf-8"))
                 if manifest_file.exists() else {})
@@ -113,16 +119,16 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
         cache = parsed_dir / f"{rel}.json"
         if cache.exists() and not force:
             rec = json.loads(cache.read_text(encoding="utf-8"))
+        elif not force:
+            continue  # curated cache: missing means deliberately removed
         else:
-            continue # After cleaning the parsed+corpus, we don't want to parse 
-                      # the documents again
             t0 = time.time()
             try:
                 if src.suffix == ".pdf":
                     converter = converter or _make_converter()
                     pages = parse_pdf(converter, src)
                 else:
-                    pages = parse_page_txt(src)
+                    pages = parse_txt(src)
                 rec = {"file": rel, "domain": rel.split("/")[0],
                        "kind": src.suffix.lstrip("."), "url": manifest.get(rel),
                        "pages": pages}
@@ -146,9 +152,7 @@ def parse_corpus(corpus_dir: Path = CORPUS_DIR, parsed_dir: Path = PARSED_DIR,
 @dataclass(frozen=True)
 class Chunk:
     """One vector-DB-ready piece of a parsed page. Chunks never cross page
-    boundaries, so each maps to one citable {file, page}; id encodes that
-    plus the position: "<file>#p<page>.<chunk_index>"."""
-    id: str
+    boundaries, so each maps to one citable {file, page}."""
     file: str
     domain: str
     kind: str          # source type: "pdf" or "txt"
@@ -156,6 +160,27 @@ class Chunk:
     page: int
     chunk_index: int
     text: str
+
+    @property
+    def id(self) -> str:
+        """Location-derived unique id: "<file>#p<page>.<chunk_index>"."""
+        return self.sibling_id(0)
+
+    def sibling_id(self, offset: int) -> str:
+        """Id of the chunk `offset` places away on the same page."""
+        return f"{self.file}#p{self.page}.{self.chunk_index + offset}"
+
+    def to_metadata(self) -> dict:
+        """Chroma-record metadata; the inverse decode lives in Hit.from_metadata.
+        Text travels as the record's document, and chroma cannot store None."""
+        return {"type": "chunk", "file": self.file, "page": self.page,
+                "domain": self.domain, "kind": self.kind,
+                "url": self.url or "", "chunk_index": self.chunk_index}
+
+    def to_record(self) -> dict:
+        """JSONL record for corpus_chunks.jsonl: all fields plus the computed
+        id, which consumers of the file (enrich.py) key on."""
+        return {"id": self.id, **asdict(self)}
 
 
 CHUNKS_FILE = Path("corpus_chunks.jsonl")
@@ -218,14 +243,13 @@ def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
     for doc in docs:
         for page in doc["pages"]:
             for j, text in enumerate(chunk_text(page["text"], size, overlap)):
-                chunks.append(Chunk(id=f"{doc['file']}#p{page['page']}.{j}",
-                                    file=doc["file"], domain=doc["domain"],
+                chunks.append(Chunk(file=doc["file"], domain=doc["domain"],
                                     kind=doc["kind"], url=doc.get("url"),
                                     page=page["page"], chunk_index=j,
                                     text=text))
     with open(out_path, "w", encoding="utf-8") as f:
         for c in chunks:
-            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+            f.write(json.dumps(c.to_record(), ensure_ascii=False) + "\n")
     sizes = sorted(len(c.text) for c in chunks)
     print(f"chunked {len(docs)} docs -> {len(chunks)} chunks -> {out_path} "
           f"(chars/chunk: median {sizes[len(sizes) // 2]}, max {sizes[-1]})")
@@ -233,81 +257,11 @@ def chunk_corpus(docs: list[dict], out_path: Path = CHUNKS_FILE,
 
 
 CHUNK_EMBEDDINGS_FILE = Path("chunk_embeddings.npz")
-DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"  # strong multilingual/Hebrew retriever
-DEFAULT_BATCH_SIZE = 32
-
-
-def _load_embedder(model_name: str):
-    # imported lazily: sentence-transformers pulls in torch
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(model_name)
-
-
-def _e5_prefix(model_name: str, kind: str) -> str:
-    # E5-family models are trained with "query: " / "passage: " prefixes;
-    # skipping them costs real retrieval quality
-    return f"{kind}: " if "e5" in model_name.lower() else ""
-
-
-def embed_texts(embedder, model_name: str, texts: list[str], kind: str = "passage",
-                batch_size: int = DEFAULT_BATCH_SIZE):
-    prefix = _e5_prefix(model_name, kind)
-    return embedder.encode([prefix + t for t in texts], batch_size=batch_size,
-                           normalize_embeddings=True,  # unit vectors: cosine == dot product
-                           show_progress_bar=len(texts) > batch_size)
-
-
-def _embedding_fingerprint(model_name: str, kind: str, items: list[tuple[str, str]]) -> str:
-    """Hash of everything the embeddings depend on: model, prefix convention,
-    and every (id, text) pair. Changing any of them invalidates caches."""
-    import hashlib
-
-    h = hashlib.sha256(model_name.encode())
-    h.update(_e5_prefix(model_name, kind).encode())
-    for id_, text in items:
-        h.update(id_.encode())
-        h.update(text.encode())
-    return h.hexdigest()
-
-
-def _embed_cached(items: list[tuple[str, str]], kind: str, out_path: Path, label: str,
-                  model_name: str = DEFAULT_EMBED_MODEL,
-                  batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
-    """Embed (id, text) items, cached in out_path keyed by _embedding_fingerprint.
-    With force=True, the cache is ignored and everything is re-embedded."""
-    import numpy as np
-
-    fingerprint = _embedding_fingerprint(model_name, kind, items)
-
-    if out_path.exists() and not force:
-        cached = np.load(out_path)
-        if str(cached["fingerprint"]) == fingerprint:
-            print(f"{label} embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
-            return cached["embeddings"]
-
-    print(f"embedding {len(items)} {label}s with {model_name} ...")
-    t0 = time.time()
-    embedder = _load_embedder(model_name)
-    embeddings = embed_texts(embedder, model_name, [text for _, text in items],
-                             kind=kind, batch_size=batch_size)
-    np.savez_compressed(out_path, embeddings=embeddings,
-                        ids=np.array([id_ for id_, _ in items]),
-                        fingerprint=np.array(fingerprint))
-    print(f"embedded {len(items)} {label}s -> {out_path} "
-          f"(shape {embeddings.shape}, {time.time() - t0:.0f}s)")
-    return embeddings
-
-
-def embed_chunks(chunks: list[Chunk], model_name: str = DEFAULT_EMBED_MODEL,
-                 out_path: Path = CHUNK_EMBEDDINGS_FILE,
-                 batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
-    return _embed_cached([(c.id, c.text) for c in chunks], kind="passage",
-                         out_path=out_path, label="chunk",
-                         model_name=model_name, batch_size=batch_size, force=force)
-
-
+QUESTION_EMBEDDINGS_FILE = Path("question_embeddings.npz")
 ENRICHED_QUESTIONS_FILE = Path("enriched_questions.jsonl")
 ENRICHED_Q_EMBEDDINGS_FILE = Path("enriched_question_embeddings.npz")
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"  # strong multilingual/Hebrew retriever
+DEFAULT_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -319,69 +273,104 @@ class EnrichedQuestion:
     question_text: str
 
 
+@dataclass(frozen=True)
+class Embedder:
+    """A sentence-transformers model paired with its name, which drives the
+    E5 query/passage prefix convention."""
+    model: object  # SentenceTransformer
+    model_name: str
+
+    @classmethod
+    def load(cls, model_name: str = DEFAULT_EMBED_MODEL) -> Self:
+        # imported lazily: sentence-transformers pulls in torch
+        from sentence_transformers import SentenceTransformer
+        return cls(model=SentenceTransformer(model_name), model_name=model_name)
+
+    def _e5_prefix(self, kind: str) -> str:
+        # E5-family models are trained with "query: " / "passage: " prefixes;
+        # skipping them costs real retrieval quality
+        return f"{kind}: " if "e5" in self.model_name.lower() else ""
+
+    def _embedding_fingerprint(self, kind: str, items: list[tuple[str, str]]) -> str:
+        """Hash of everything the embeddings depend on: model, prefix convention,
+        and every (id, text) pair. Changing any of them invalidates caches."""
+        import hashlib
+
+        h = hashlib.sha256(self.model_name.encode())
+        h.update(self._e5_prefix(kind).encode())
+        for id_, text in items:
+            h.update(id_.encode())
+            h.update(text.encode())
+        return h.hexdigest()
+
+    def encode(self, texts: list[str], kind: str = "passage",
+               batch_size: int = DEFAULT_BATCH_SIZE):
+        prefix = self._e5_prefix(kind)
+        return self.model.encode([prefix + t for t in texts], batch_size=batch_size,
+                                 normalize_embeddings=True,  # unit vectors: cosine == dot product
+                                 show_progress_bar=len(texts) > batch_size)
+
+    def _embed_cached(self, items: list[tuple[str, str]], kind: str, out_path: Path,
+                      label: str, batch_size: int = DEFAULT_BATCH_SIZE,
+                      force: bool = False):
+        """Embed (id, text) items, cached in out_path keyed by
+        _embedding_fingerprint. With force=True, the cache is ignored and
+        everything is re-embedded."""
+        import numpy as np
+
+        fingerprint = self._embedding_fingerprint(kind, items)
+
+        if out_path.exists() and not force:
+            cached = np.load(out_path)
+            if str(cached["fingerprint"]) == fingerprint:
+                print(f"{label} embeddings: cache hit ({out_path}, {cached['embeddings'].shape})")
+                return cached["embeddings"]
+
+        print(f"embedding {len(items)} {label}s with {self.model_name} ...")
+        t0 = time.time()
+        embeddings = self.encode([text for _, text in items],
+                                 kind=kind, batch_size=batch_size)
+        np.savez_compressed(out_path, embeddings=embeddings,
+                            ids=np.array([id_ for id_, _ in items]),
+                            fingerprint=np.array(fingerprint))
+        print(f"embedded {len(items)} {label}s -> {out_path} "
+              f"(shape {embeddings.shape}, {time.time() - t0:.0f}s)")
+        return embeddings
+
+    def embed_chunks(self, chunks: list[Chunk], out_path: Path = CHUNK_EMBEDDINGS_FILE,
+                     batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+        return self._embed_cached([(c.id, c.text) for c in chunks], kind="passage",
+                                  out_path=out_path, label="chunk",
+                                  batch_size=batch_size, force=force)
+
+    def embed_questions(self, questions: list[str],
+                        out_path: Path = QUESTION_EMBEDDINGS_FILE,
+                        batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+        """Embed user questions, cached on disk so repeated runs over the same
+        question set skip the encoding pass (the text is its own cache id)."""
+        return self._embed_cached([(q, q) for q in questions], kind="query",
+                                  out_path=out_path, label="question",
+                                  batch_size=batch_size, force=force)
+
+    def embed_enriched_questions(self, questions: list[EnrichedQuestion],
+                                 out_path: Path = ENRICHED_Q_EMBEDDINGS_FILE,
+                                 batch_size: int = DEFAULT_BATCH_SIZE,
+                                 force: bool = False):
+        # kind="query": these are questions matched against real user questions, so
+        # they carry the same E5 "query: " prefix (symmetric question-to-question match)
+        return self._embed_cached([(q.question_id, q.question_text) for q in questions],
+                                  kind="query", out_path=out_path,
+                                  label="enriched question",
+                                  batch_size=batch_size, force=force)
+
+
 def load_enriched_questions(path: Path = ENRICHED_QUESTIONS_FILE) -> list[EnrichedQuestion]:
     """Load the per-chunk synthetic questions (one JSON object per line)."""
     with open(path, encoding="utf-8") as f:
         return [EnrichedQuestion(**json.loads(line)) for line in f if line.strip()]
 
 
-def embed_enriched_questions(questions: list[EnrichedQuestion],
-                             model_name: str = DEFAULT_EMBED_MODEL,
-                             out_path: Path = ENRICHED_Q_EMBEDDINGS_FILE,
-                             batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
-    # kind="query": these are questions matched against real user questions, so
-    # they carry the same E5 "query: " prefix (symmetric question-to-question match)
-    return _embed_cached([(q.question_id, q.question_text) for q in questions],
-                         kind="query", out_path=out_path, label="enriched question",
-                         model_name=model_name, batch_size=batch_size, force=force)
-
-
 CHROMA_COLLECTION = "harel_corpus"
-
-
-def build_vector_db(chunks: list[Chunk], embeddings, name: str = CHROMA_COLLECTION):
-    """Insert chunks + precomputed embeddings into an in-memory chromadb
-    collection, rebuilt on every run (the embeddings themselves stay cached
-    on disk, so this only costs a few seconds)."""
-    import chromadb
-
-    t0 = time.time()
-    client = chromadb.EphemeralClient()
-    collection = client.create_collection(name, metadata={"hnsw:space": "cosine"})
-    batch_size = 2048
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        collection.add(ids=[c.id for c in batch],
-                embeddings=embeddings[i:i + batch_size],
-                documents=[c.text for c in batch],
-                metadatas=[{"type": "chunk", "file": c.file, "page": c.page,
-                            "domain": c.domain, "kind": c.kind,
-                            "url": c.url or "", "chunk_index": c.chunk_index}
-                           for c in batch])
-    print(f"vector db: inserted {collection.count()} chunks into in-memory collection "
-          f"'{name}' ({time.time() - t0:.0f}s)")
-    return collection
-
-
-def add_questions_to_db(collection, questions: list[EnrichedQuestion], embeddings):
-    """Insert enriched questions + their embeddings into the existing collection.
-
-    Each question record carries type="question" and the chunk_id it was
-    generated from, so a question that wins a query can be resolved back to its
-    source chunk (metadata["chunk_id"]) for text and citation."""
-    t0 = time.time()
-    batch_size = 2048
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i:i + batch_size]
-        collection.add(ids=[q.question_id for q in batch],
-                embeddings=embeddings[i:i + batch_size],
-                documents=[q.question_text for q in batch],
-                metadatas=[{"type": "question", "chunk_id": q.chunk_id} for q in batch])
-    print(f"vector db: inserted {len(questions)} enriched questions -> collection now "
-          f"holds {collection.count()} records ({time.time() - t0:.0f}s)")
-    return collection
-
-
 DEFAULT_TOP_K = 10
 DEFAULT_EXPAND = 2
 # the collection is mostly enriched questions, and many map to the same chunk,
@@ -398,102 +387,165 @@ def _merge_adjacent(left: str, right: str) -> str:
     return left + "\n\n" + right
 
 
-def expand_hits(collection, hits: list[dict], radius: int) -> list[dict]:
-    """Widen each hit's text with up to `radius` neighbouring chunks on each
-    side. Neighbours never cross a page boundary (chunk ids encode the page),
-    so every hit still maps to one citable {file, page}. Chunks that are hits
-    themselves, or already claimed by a higher-ranked hit, are not repeated."""
-    def chunk_id(h: dict, j: int) -> str:
-        return f"{h['file']}#p{h['page']}.{j}"
+@dataclass(frozen=True)
+class Hit:
+    """A retrieved chunk plus its retrieval score; text starts as the chunk's
+    own text and may be widened with page-neighbours by expand_hits."""
+    chunk: Chunk
+    score: float  # cosine similarity of the winning query match
+    text: str     # the context window built around the chunk
 
-    used = {chunk_id(h, h["chunk_index"]) for h in hits}
-    wanted = []
-    for h in hits:
-        for j in range(max(h["chunk_index"] - radius, 0), h["chunk_index"] + radius + 1):
-            cid = chunk_id(h, j)
-            if cid not in used and cid not in wanted:
-                wanted.append(cid)
-    if not wanted:
-        return hits
-    got = collection.get(ids=wanted)  # ids past the end of a page just come back missing
-    neighbours = dict(zip(got["ids"], got["documents"]))
-
-    for h in hits:  # score order, so better hits claim shared neighbours first
-        parts = [h["text"]]
-        for j in range(h["chunk_index"] - 1, h["chunk_index"] - radius - 1, -1):
-            text = neighbours.pop(chunk_id(h, j), None)
-            if text is None:
-                break
-            parts.insert(0, text)
-        for j in range(h["chunk_index"] + 1, h["chunk_index"] + radius + 1):
-            text = neighbours.pop(chunk_id(h, j), None)
-            if text is None:
-                break
-            parts.append(text)
-        text = parts[0]
-        for part in parts[1:]:
-            text = _merge_adjacent(text, part)
-        h["text"] = text
-    return hits
+    @classmethod
+    def from_metadata(cls, meta: dict, text: str, score: float) -> Self:
+        """Build a Hit from a chroma chunk-record metadata dict + document."""
+        chunk = Chunk(file=meta["file"], domain=meta["domain"], kind=meta["kind"],
+                      url=meta["url"] or None, page=meta["page"],
+                      chunk_index=meta["chunk_index"], text=text)
+        return cls(chunk=chunk, score=score, text=chunk.text)
 
 
-def _resolve_to_chunks(collection, raw_hits: list[dict], k: int) -> list[dict]:
-    """Turn a mixed pool of raw query hits into up to k distinct chunk hits.
+@dataclass(frozen=True)
+class Retriever:
+    """Query-time retrieval over one chroma collection holding corpus chunks
+    plus enriched questions that resolve back to their source chunks."""
+    collection: object  # chromadb collection
 
-    A "question" hit resolves to its source chunk (via chunk_id), inheriting the
-    question's cosine score; a "chunk" hit maps to itself. Hits stay in query
-    rank order, and duplicates (several questions pointing at one chunk, or a
-    chunk that is also a direct hit) collapse to their first, best-ranked
-    occurrence. Every returned hit carries the chunk fields the rest of the
-    pipeline expects (file, page, kind, chunk_index, text)."""
-    # fetch the bodies+metadata of the chunks that question hits point at
-    q_chunk_ids = list(dict.fromkeys(
-        h["chunk_id"] for h in raw_hits if h.get("type") == "question"))
-    chunks = {}
-    if q_chunk_ids:
-        got = collection.get(ids=q_chunk_ids)  # ids with no chunk come back missing
-        chunks = dict(zip(got["ids"], zip(got["documents"], got["metadatas"])))
+    @classmethod
+    def build(cls, chunks: list[Chunk], embeddings,
+              name: str = CHROMA_COLLECTION) -> Self:
+        """Insert chunks + precomputed embeddings into an in-memory chromadb
+        collection, rebuilt on every run (the embeddings themselves stay cached
+        on disk, so this only costs a few seconds)."""
+        import chromadb
 
-    hits, seen = [], set()
-    for h in raw_hits:
-        if h.get("type") == "question":
-            resolved = chunks.get(h["chunk_id"])
-            if resolved is None:  # chunk_id not in the current chunking -- skip
+        t0 = time.time()
+        client = chromadb.EphemeralClient()
+        retriever = cls(collection=client.create_collection(
+            name, metadata={"hnsw:space": "cosine"}))
+        retriever._add_batched(ids=[c.id for c in chunks],
+                               embeddings=embeddings,
+                               documents=[c.text for c in chunks],
+                               metadatas=[c.to_metadata() for c in chunks])
+        print(f"vector db: inserted {retriever.collection.count()} chunks into "
+              f"in-memory collection '{name}' ({time.time() - t0:.0f}s)")
+        return retriever
+
+    def add_questions(self, questions: list[EnrichedQuestion], embeddings):
+        """Insert enriched questions + their embeddings into the collection.
+
+        Each question record carries type="question" and the chunk_id it was
+        generated from, so a question that wins a query can be resolved back to
+        its source chunk (metadata["chunk_id"]) for text and citation."""
+        t0 = time.time()
+        self._add_batched(ids=[q.question_id for q in questions],
+                          embeddings=embeddings,
+                          documents=[q.question_text for q in questions],
+                          metadatas=[{"type": "question", "chunk_id": q.chunk_id}
+                                     for q in questions])
+        print(f"vector db: inserted {len(questions)} enriched questions -> collection "
+              f"now holds {self.collection.count()} records ({time.time() - t0:.0f}s)")
+
+    def _add_batched(self, ids: list[str], embeddings, documents: list[str],
+                     metadatas: list[dict], batch_size: int = 2048):
+        """collection.add in slices; chroma rejects overly large single inserts."""
+        for i in range(0, len(ids), batch_size):
+            self.collection.add(ids=ids[i:i + batch_size],
+                                embeddings=embeddings[i:i + batch_size],
+                                documents=documents[i:i + batch_size],
+                                metadatas=metadatas[i:i + batch_size])
+
+    def query_top_k(self, query_embedding, k: int = DEFAULT_TOP_K,
+                    expand: int = DEFAULT_EXPAND) -> list[Hit]:
+        """Return the k nearest chunks as Hits, each expanded with `expand`
+        neighbouring chunks on either side.
+
+        The collection holds both chunks and enriched questions; a matched
+        question resolves to its source chunk, so callers always see
+        chunk-shaped hits."""
+        pool = max(k * QUESTION_POOL_FACTOR, k)
+        res = self.collection.query(query_embeddings=[query_embedding], n_results=pool)
+        raw = [(meta, doc, 1 - dist)
+               for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
+                                          res["distances"][0])]
+        hits = self._resolve_to_chunks(raw, k)
+        return self.expand_hits(hits, expand) if expand > 0 else hits
+
+    def _resolve_to_chunks(self, raw_hits: list[tuple[dict, str, float]],
+                           k: int) -> list[Hit]:
+        """Turn a mixed pool of raw (metadata, document, score) query rows into
+        up to k distinct chunk Hits.
+
+        A "question" row resolves to its source chunk (via chunk_id), inheriting
+        the question's cosine score; a "chunk" row maps to itself. Hits stay in
+        query rank order, and duplicates (several questions pointing at one
+        chunk, or a chunk that is also a direct hit) collapse to their first,
+        best-ranked occurrence."""
+        # fetch the bodies+metadata of the chunks that question rows point at
+        q_chunk_ids = list(dict.fromkeys(
+            meta["chunk_id"] for meta, _, _ in raw_hits
+            if meta.get("type") == "question"))
+        chunks = {}
+        if q_chunk_ids:
+            got = self.collection.get(ids=q_chunk_ids)  # ids with no chunk come back missing
+            chunks = dict(zip(got["ids"], zip(got["documents"], got["metadatas"])))
+
+        hits, seen = [], set()
+        for meta, doc, score in raw_hits:
+            if meta.get("type") == "question":
+                resolved = chunks.get(meta["chunk_id"])
+                if resolved is None:  # chunk_id not in the current chunking -- skip
+                    continue
+                doc, meta = resolved
+            hit = Hit.from_metadata(meta, text=doc, score=score)
+            key = hit.chunk.id
+            if key in seen:
                 continue
-            doc, meta = resolved
-            hit = {**meta, "text": doc, "score": h["score"]}
-        else:
-            hit = h
-        key = (hit["file"], hit["page"], hit["chunk_index"])
-        if key in seen:
-            continue
-        seen.add(key)
-        hits.append(hit)
-        if len(hits) == k:
-            break
-    return hits
+            seen.add(key)
+            hits.append(hit)
+            if len(hits) == k:
+                break
+        return hits
+
+    def expand_hits(self, hits: list[Hit], radius: int) -> list[Hit]:
+        """Widen each hit's text with up to `radius` neighbouring chunks on each
+        side. Neighbours never cross a page boundary (chunk ids encode the page),
+        so every hit still maps to one citable {file, page}. Chunks that are hits
+        themselves, or already claimed by a higher-ranked hit, are not repeated."""
+        used = {h.chunk.id for h in hits}
+        wanted = {h.chunk.sibling_id(off)
+                  for h in hits
+                  for off in range(-radius, radius + 1)
+                  if h.chunk.chunk_index + off >= 0
+                  } - used
+        if not wanted:
+            return hits
+        got = self.collection.get(ids=list(wanted))  # ids past the end of a page just come back missing
+        neighbours = dict(zip(got["ids"], got["documents"]))
+
+        expanded = []
+        for h in hits:  # score order, so better hits claim shared neighbours first
+            parts = [h.text]
+            for off in range(-1, -radius - 1, -1):
+                text = neighbours.pop(h.chunk.sibling_id(off), None)
+                if text is None:
+                    break
+                parts.insert(0, text)
+            for off in range(1, radius + 1):
+                text = neighbours.pop(h.chunk.sibling_id(off), None)
+                if text is None:
+                    break
+                parts.append(text)
+            text = parts[0]
+            for part in parts[1:]:
+                text = _merge_adjacent(text, part)
+            expanded.append(replace(h, text=text))
+        return expanded
 
 
-def query_top_k(collection, query_embedding, k: int = DEFAULT_TOP_K,
-                expand: int = DEFAULT_EXPAND) -> list[dict]:
-    """Return the k nearest chunks as dicts: metadata + text + cosine score,
-    each expanded with `expand` neighbouring chunks on either side.
-
-    The collection holds both chunks and enriched questions; a matched question
-    resolves to its source chunk, so callers always see chunk-shaped hits."""
-    pool = max(k * QUESTION_POOL_FACTOR, k)
-    res = collection.query(query_embeddings=[query_embedding], n_results=pool)
-    raw = [{**meta, "text": doc, "score": 1 - dist}
-           for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
-                                      res["distances"][0])]
-    hits = _resolve_to_chunks(collection, raw, k)
-    return expand_hits(collection, hits, expand) if expand > 0 else hits
-
-
-def build_rag_prompt(question: str, hits: list[dict]) -> str:
+def build_rag_prompt(question: str, hits: list[Hit]) -> str:
     """User message: numbered source chunks + the question + citation protocol."""
     sources = "\n\n---\n\n".join(
-        f"[{i}] file: {h['file']} | page: {h['page']}\n{h['text']}"
+        f"[{i}] file: {h.chunk.file} | page: {h.chunk.page}\n{h.text}"
         for i, h in enumerate(hits, 1))
     return f"""Below are excerpts from official Harel insurance documents, followed by a customer question.
 
@@ -521,7 +573,7 @@ class SourceRef:
     page: int | None
 
 
-def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[SourceRef]]:
+def extract_citations(answer: str, hits: list[Hit]) -> tuple[str, list[SourceRef]]:
     """Split the CITED: trailer off the model reply and resolve the numbers to
     SourceRef citations."""
     m = _CITED_RE.search(answer.strip())
@@ -532,8 +584,8 @@ def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[SourceRe
         i = int(tok) - 1
         if 0 <= i < len(hits):
             h = hits[i]
-            ref = SourceRef(file=h["file"],
-                            page=h["page"] if h["kind"] == "pdf" else None)
+            ref = SourceRef(file=h.chunk.file,
+                            page=h.chunk.page if h.chunk.kind == "pdf" else None)
             if ref not in seen:
                 seen.add(ref)
                 citations.append(ref)
@@ -556,34 +608,33 @@ def resolve_model(model: str = MODEL) -> tuple[str, dict]:
     return model, kwargs
 
 
-def build_pipeline(chunk_size: int = DEFAULT_CHUNK_SIZE,
+def build_pipeline(embedder: Embedder, chunk_size: int = DEFAULT_CHUNK_SIZE,
                    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-                   embed_model: str = DEFAULT_EMBED_MODEL,
-                   batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False):
+                   batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False) -> Retriever:
     """Build the full retrieval stack -- parse -> chunk -> embed -> vector db
-    with enriched questions -- and return the queryable collection. Parsing,
+    with enriched questions -- and return the queryable Retriever. Parsing,
     chunking and embeddings are disk-cached, so a warm build takes seconds."""
     docs = parse_corpus(force=force)
     n_pages = sum(len(d["pages"]) for d in docs)
     print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
 
     chunks = chunk_corpus(docs, size=chunk_size, overlap=chunk_overlap)
-    embeddings = embed_chunks(chunks, model_name=embed_model,
-                              batch_size=batch_size, force=force)
-    collection = build_vector_db(chunks, embeddings)
+    embeddings = embedder.embed_chunks(chunks, batch_size=batch_size, force=force)
+    retriever = Retriever.build(chunks, embeddings)
 
     # index the per-chunk synthetic questions alongside the chunks: a real user
     # question can match a pre-generated question, which resolves to its chunk
     if ENRICHED_QUESTIONS_FILE.exists():
         enriched = load_enriched_questions()
         print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
-        enriched_vecs = embed_enriched_questions(enriched, model_name=embed_model,
-                                                 batch_size=batch_size, force=force)
-        add_questions_to_db(collection, enriched, enriched_vecs)
+        enriched_vecs = embedder.embed_enriched_questions(enriched,
+                                                          batch_size=batch_size,
+                                                          force=force)
+        retriever.add_questions(enriched, enriched_vecs)
     else:
         print(f"WARNING: {ENRICHED_QUESTIONS_FILE} not found -- retrieval runs on "
               f"chunks only (generate it with enrich.py)")
-    return collection
+    return retriever
 
 
 @dataclass(frozen=True)
@@ -591,54 +642,60 @@ class AnswerResult:
     """One answered question, as yielded by answer_questions."""
     answer: str
     citations: list[SourceRef]
-    hits: list[dict]   # chunk-shaped retrieval hits (see query_top_k)
+    hits: list[Hit]    # retrieval hits, in rank order
     response: object   # raw litellm response, for token/cost accounting
     latency_ms: float  # retrieval + generation (batch embedding is amortized)
 
 
-def answer_questions(collection, embedder, questions: list[str], *,
-                     model: str = MODEL, system_prompt: str = V4_SYSTEM,
-                     embed_model: str = DEFAULT_EMBED_MODEL,
-                     batch_size: int = DEFAULT_BATCH_SIZE,
-                     k: int = DEFAULT_TOP_K, expand: int = DEFAULT_EXPAND):
-    """Answer live questions: the whole batch is embedded in one encoder pass,
-    then each question is retrieved -> generated -> cited in turn. Yields one
-    AnswerResult per question in input order, lazily, so callers can stream
-    results to disk as they arrive."""
-    llm_model, kwargs = resolve_model(model)
-    q_vecs = embed_texts(embedder, embed_model, questions, kind="query",
-                         batch_size=batch_size)
-    for question, q_vec in zip(questions, q_vecs):
-        t0 = time.time()
-        hits = query_top_k(collection, q_vec, k=k, expand=expand)
-        resp = litellm.completion(model=llm_model, messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": build_rag_prompt(question, hits)}],
-            timeout=120, **kwargs)
-        answer, citations = extract_citations(resp.choices[0].message.content, hits)
-        yield AnswerResult(answer=answer, citations=citations, hits=hits,
-                           response=resp, latency_ms=(time.time() - t0) * 1000)
-
-
 @dataclass(frozen=True)
-class Service:
-    """Serving state built once by init_service."""
-    collection: object  # chromadb collection over chunks + enriched questions
-    embedder: object    # SentenceTransformer that embeds live queries
-    embed_model: str    # its model name (drives the E5 query prefix)
+class RAGRunner:
+    """The serving stack: retriever + query embedder, built once by
+    RAGRunner.init (API startup and eval CLI alike)."""
+    retriever: Retriever  # queryable index over chunks + enriched questions
+    embedder: Embedder    # embeds live queries
 
+    _instance: ClassVar["RAGRunner | None"] = None
 
-_service: Service | None = None
+    @classmethod
+    def init(cls, chunk_size: int = DEFAULT_CHUNK_SIZE,
+             chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+             embed_model: str = DEFAULT_EMBED_MODEL,
+             batch_size: int = DEFAULT_BATCH_SIZE, force: bool = False) -> Self:
+        """Assemble the serving stack from the corpus pipeline, once: repeat
+        calls return the memoized instance and ignore the parameters."""
+        if cls._instance is None:
+            embedder = Embedder.load(embed_model)
+            cls._instance = cls(retriever=build_pipeline(embedder,
+                                                         chunk_size=chunk_size,
+                                                         chunk_overlap=chunk_overlap,
+                                                         batch_size=batch_size,
+                                                         force=force),
+                                embedder=embedder)
+        return cls._instance
 
-
-def init_service(embed_model: str = DEFAULT_EMBED_MODEL) -> Service:
-    """Build the retrieval stack and load the query embedder once (idempotent)."""
-    global _service
-    if _service is None:
-        _service = Service(collection=build_pipeline(embed_model=embed_model),
-                           embedder=_load_embedder(embed_model),
-                           embed_model=embed_model)
-    return _service
+    def answer_questions(self, questions: list[str], *,
+                         model: str = MODEL, system_prompt: str = V4_SYSTEM,
+                         batch_size: int = DEFAULT_BATCH_SIZE,
+                         k: int = DEFAULT_TOP_K, expand: int = DEFAULT_EXPAND,
+                         force: bool = False):
+        """Answer live questions: the whole batch is embedded in one encoder
+        pass via Embedder.embed_questions (disk-cached across runs; force=True
+        re-embeds), then each question is retrieved -> generated -> cited in
+        turn. Yields one AnswerResult per question in input order, lazily, so
+        callers can stream results to disk as they arrive."""
+        llm_model, kwargs = resolve_model(model)
+        q_vecs = self.embedder.embed_questions(questions, batch_size=batch_size,
+                                               force=force)
+        for question, q_vec in zip(questions, q_vecs):
+            t0 = time.time()
+            hits = self.retriever.query_top_k(q_vec, k=k, expand=expand)
+            resp = litellm.completion(model=llm_model, messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": build_rag_prompt(question, hits)}],
+                timeout=120, **kwargs)
+            answer, citations = extract_citations(resp.choices[0].message.content, hits)
+            yield AnswerResult(answer=answer, citations=citations, hits=hits,
+                               response=resp, latency_ms=(time.time() - t0) * 1000)
 
 
 def main():
@@ -669,8 +726,10 @@ def main():
                     help="neighbouring chunks to merge into each hit on either side "
                          "(0 disables expansion)")
     ap.add_argument("--force", action="store_true",
-                    help="ignore cached files: re-parse the corpus "
-                         "and re-embed chunks and enriched questions")
+                    help="ignore cached files: re-parse the corpus from raw "
+                         "sources (undoes clean_data.py curation -- re-run it "
+                         "afterwards) and re-embed chunks, questions and "
+                         "enriched questions")
     args = ap.parse_args()
 
     if args.parse_corpus or args.chunk_corpus:
@@ -682,36 +741,35 @@ def main():
             chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
         return
 
-    collection = build_pipeline(chunk_size=args.chunk_size,
-                                chunk_overlap=args.chunk_overlap,
-                                embed_model=args.embed_model,
-                                batch_size=args.embed_batch_size, force=args.force)
-    embedder = _load_embedder(args.embed_model)
+    runner = RAGRunner.init(chunk_size=args.chunk_size,
+                            chunk_overlap=args.chunk_overlap,
+                            embed_model=args.embed_model,
+                            batch_size=args.embed_batch_size, force=args.force)
 
     questions = json.load(open(args.questions, encoding="utf-8"))
     if isinstance(questions, dict):  # staff sets wrap the list in {"questions": [...]}
         questions = questions["questions"]
 
-    results = answer_questions(collection, embedder,
-                               [item["question"] for item in questions],
-                               model=args.model, system_prompt=args.system_prompt,
-                               embed_model=args.embed_model,
-                               batch_size=args.embed_batch_size,
-                               k=args.top_k, expand=args.expand)
+    results = runner.answer_questions([item["question"] for item in questions],
+                                   model=args.model,
+                                   system_prompt=args.system_prompt,
+                                   batch_size=args.embed_batch_size,
+                                   k=args.top_k, expand=args.expand,
+                                   force=args.force)
     with open(args.out, "w", encoding="utf-8") as out:
         for q, result in zip(questions, results):
             hits, resp = result.hits, result.response
             rec = {"id": q["id"],
                    "answer": result.answer,
                    "citations": [asdict(c) for c in result.citations],
-                   "retrieved": [{"file": h["file"], "page": h["page"],
-                                  "score": round(h["score"], 3)} for h in hits],
+                   "retrieved": [{"file": h.chunk.file, "page": h.chunk.page,
+                                  "score": round(h.score, 3)} for h in hits],
                    "latency_ms": result.latency_ms,
                    "tokens": {"prompt": resp.usage.prompt_tokens,
                               "completion": resp.usage.completion_tokens}}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print(f"{q['id']}: {result.answer[:70]!r}... ({result.latency_ms:.0f} ms; "
-                  f"top hit {hits[0]['file']} p{hits[0]['page']} @{hits[0]['score']:.2f})")
+                  f"top hit {hits[0].chunk.file} p{hits[0].chunk.page} @{hits[0].score:.2f})")
     
     print(f"\nwrote {args.out} -- now score it with your evaluation harness")
 

@@ -20,7 +20,7 @@ import litellm
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from rag_runner import answer_questions, init_service
+from rag_runner import RAGRunner
 
 
 class AskRequest(BaseModel):
@@ -45,7 +45,7 @@ class AskResponse(BaseModel):
 
 app = FastAPI(title="APEX Exercise 2 -- Harel Support Agent")
 
-init_service()  # build the RAG retrieval stack at startup, not on the first /ask
+RAGRunner.init()  # build the RAG retrieval stack at startup, not on the first /ask
 
 
 @app.get("/health")
@@ -56,9 +56,8 @@ def health():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     t0 = time.time()
-    svc = init_service()
-    result = next(answer_questions(svc.collection, svc.embedder, [req.question],
-                                   embed_model=svc.embed_model))
+    runner = RAGRunner.init()
+    result = next(runner.answer_questions([req.question]))
     hits = result.hits
     citations = [Citation(file=c.file, page=c.page) for c in result.citations]
 
@@ -70,9 +69,9 @@ def ask(req: AskRequest) -> AskResponse:
     return AskResponse(
         answer=result.answer,
         citations=citations,
-        domain=hits[0]["domain"] if hits else None,
+        domain=hits[0].chunk.domain if hits else None,
         # top-hit retrieval similarity, zeroed when the model cited nothing
-        confidence=min(max(float(hits[0]["score"]), 0.0), 1.0) if citations else 0.0,
+        confidence=min(max(float(hits[0].score), 0.0), 1.0) if citations else 0.0,
         latency_ms=(time.time() - t0) * 1000,
         cost_usd=cost,
     )
