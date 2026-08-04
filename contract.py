@@ -13,10 +13,13 @@ Run this stub as-is to see the contract in action:
 
 Replace `answer_question` with your actual system. Do not change the models.
 """
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+import rag_runner
 
 
 class AskRequest(BaseModel):
@@ -39,19 +42,35 @@ class AskResponse(BaseModel):
     cost_usd: Optional[float] = Field(None, description="Estimated $ cost of answering this question")
 
 
-app = FastAPI(title="APEX Exercise 2 -- Harel Support Agent")
+# Built once at startup and reused across requests (the vector db + embedder are
+# expensive to construct). Populated by the lifespan handler below.
+rag_system: Optional["rag_runner.RagSystem"] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global rag_system
+    rag_system = rag_runner.build_rag_system()  # parse -> chunk -> embed -> index (disk-cached)
+    print("RAG system ready; serving /ask")
+    yield
+
+
+app = FastAPI(title="APEX Exercise 2 -- Harel Support Agent", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok" if rag_system is not None else "starting"}
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
-    # TODO: replace this stub with your system.
+    result = rag_system.answer(req.question)
     return AskResponse(
-        answer="אין לי עדיין מערכת מאחורי ה-API הזה.",
-        citations=[],
-        confidence=0.0,
+        answer=result["answer"],
+        citations=[Citation(file=c["file"], page=c["page"]) for c in result["citations"]],
+        domain=result["domain"],
+        confidence=result["confidence"],
+        latency_ms=result["latency_ms"],
+        cost_usd=result["cost_usd"],
     )

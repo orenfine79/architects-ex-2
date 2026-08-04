@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from eval_harness import run_evaluation
 # Loads the variables from .env into the environment
 load_dotenv() 
 
-MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+MODEL = "google/gemma-3-27b-it"
 
 # V1 
 V1_SYSTEM = """
@@ -520,6 +521,143 @@ def extract_citations(answer: str, hits: list[dict]) -> tuple[str, list[dict]]:
     return answer.strip()[:m.start()].rstrip(), citations
 
 
+def _resolve_model(model: str) -> tuple[str, dict]:
+    """Resolve a model id to a litellm (model, kwargs) pair.
+
+    OPENAI_BASE_URL forces the openai/ route to that endpoint whatever the model
+    id looks like (Token Factory ids contain "/"); a bare name also gets the
+    openai/ prefix so litellm doesn't guess the provider."""
+    kwargs = {}
+    base = os.getenv("OPENAI_BASE_URL")
+    if base:
+        kwargs["api_base"] = base
+        model = f"openai/{model.removeprefix('openai/')}"
+    elif "/" not in model:
+        model = f"openai/{model}"
+    return model, kwargs
+
+
+def _answer_record(answer: str, citations: list[dict], hits: list[dict],
+                   resp, latency_ms: float) -> dict:
+    """Package one generated answer into the record shape shared by the batch
+    jsonl and the HTTP contract (contract.AskResponse)."""
+    try:
+        cost = litellm.completion_cost(resp)  # unknown custom models raise -- leave null
+    except Exception:
+        cost = None
+    top = hits[0] if hits else None
+    return {
+        "answer": answer,
+        "citations": citations,
+        "retrieved": [{"file": h["file"], "page": h["page"], "score": round(h["score"], 3)}
+                      for h in hits],
+        "latency_ms": latency_ms,
+        "tokens": {"prompt": resp.usage.prompt_tokens,
+                   "completion": resp.usage.completion_tokens},
+        "domain": top.get("domain") if top else None,
+        "confidence": round(max(0.0, min(1.0, top["score"])), 3) if top else None,
+        "cost_usd": cost,
+    }
+
+
+class RagSystem:
+    """A built RAG system ready to answer live questions: the in-memory vector
+    db, the query embedder (loaded lazily on the first live query), the resolved
+    litellm model + routing, and the retrieval/generation knobs.
+
+    Build once with build_rag_system(); call answer() per question. The batch
+    CLI reuses retrieve()/generate() with its own disk-cached question vectors."""
+
+    def __init__(self, collection, embed_model: str, model: str, kwargs: dict,
+                 system_prompt: str, top_k: int = DEFAULT_TOP_K,
+                 expand: int = DEFAULT_EXPAND, batch_size: int = DEFAULT_BATCH_SIZE):
+        self.collection = collection
+        self.embed_model = embed_model
+        self.model = model
+        self.kwargs = kwargs
+        self.system_prompt = system_prompt
+        self.top_k = top_k
+        self.expand = expand
+        self.batch_size = batch_size
+        self._embedder = None
+        self._embedder_lock = threading.Lock()
+
+    @property
+    def embedder(self):
+        # double-checked lock: the server serves requests from a threadpool, and
+        # loading the torch model in several threads at once crashes the process
+        if self._embedder is None:
+            with self._embedder_lock:
+                if self._embedder is None:
+                    self._embedder = _load_embedder(self.embed_model)
+        return self._embedder
+
+    def warmup(self):
+        """Force the query embedder to load now (server startup), so it never
+        loads lazily on a request thread. The batch CLI skips this."""
+        _ = self.embedder
+        return self
+
+    def retrieve(self, q_vec) -> list[dict]:
+        return query_top_k(self.collection, q_vec, k=self.top_k, expand=self.expand)
+
+    def generate(self, question: str, hits: list[dict]) -> tuple[str, list[dict], object]:
+        resp = litellm.completion(model=self.model, messages=[
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": build_rag_prompt(question, hits)}],
+            timeout=120, **self.kwargs)
+        answer, citations = extract_citations(resp.choices[0].message.content, hits)
+        return answer, citations, resp
+
+    def answer(self, question: str) -> dict:
+        """Embed, retrieve, generate, and package one answer for a live question."""
+        t0 = time.time()
+        q_vec = embed_texts(self.embedder, self.embed_model, [question],
+                            kind="query", batch_size=self.batch_size)[0]
+        hits = self.retrieve(q_vec)
+        answer, citations, resp = self.generate(question, hits)
+        return _answer_record(answer, citations, hits, resp, (time.time() - t0) * 1000)
+
+
+def _finish_build(chunks: list[dict], model: str, system_prompt: str, embed_model: str,
+                  batch_size: int, top_k: int, expand: int, force: bool) -> "RagSystem":
+    """Shared build tail: embed chunks, build the db, index the enriched
+    questions, resolve the model. Assumes the corpus is already parsed+chunked."""
+    embeddings = embed_chunks(chunks, model_name=embed_model,
+                              batch_size=batch_size, force=force)
+    collection = build_vector_db(chunks, embeddings)
+
+    # index the per-chunk synthetic questions alongside the chunks: a real user
+    # question can match a pre-generated question, which resolves to its chunk
+    enriched = load_enriched_questions()
+    print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
+    enriched_vecs = embed_enriched_questions(enriched, model_name=embed_model,
+                                             batch_size=batch_size, force=force)
+    add_questions_to_db(collection, enriched, enriched_vecs)
+
+    resolved_model, kwargs = _resolve_model(model)
+    return RagSystem(collection, embed_model, resolved_model, kwargs, system_prompt,
+                     top_k=top_k, expand=expand, batch_size=batch_size)
+
+
+def build_rag_system(model: str = MODEL, system_prompt: str = V4_SYSTEM,
+                     embed_model: str = DEFAULT_EMBED_MODEL,
+                     batch_size: int = DEFAULT_BATCH_SIZE, top_k: int = DEFAULT_TOP_K,
+                     expand: int = DEFAULT_EXPAND, chunk_size: int = DEFAULT_CHUNK_SIZE,
+                     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+                     force: bool = False) -> "RagSystem":
+    """Build the full RAG system (parse -> chunk -> embed -> index) ready to
+    answer live questions. Everything is disk-cached, so on a warm cache this is
+    a few seconds. This is the entry point the HTTP server (contract.py) calls."""
+    docs = parse_corpus(force=force)
+    n_pages = sum(len(d["pages"]) for d in docs)
+    print(f"corpus: {len(docs)} documents / {n_pages} pages (cache: {PARSED_DIR}/)")
+    chunks = chunk_corpus(docs, size=chunk_size, overlap=chunk_overlap)
+    system = _finish_build(chunks, model, system_prompt, embed_model,
+                           batch_size, top_k, expand, force)
+    return system.warmup()  # load the query embedder now, off the request path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="reference_questions.json")
@@ -562,28 +700,9 @@ def main():
     chunks = chunk_corpus(docs, size=args.chunk_size, overlap=args.chunk_overlap)
     if args.chunk_corpus:
         return
-    
-    embeddings = embed_chunks(chunks, model_name=args.embed_model,
-                              batch_size=args.embed_batch_size, force=args.force)
-    collection = build_vector_db(chunks, embeddings)
 
-    # index the per-chunk synthetic questions alongside the chunks: a real user
-    # question can match a pre-generated question, which resolves to its chunk
-    enriched = load_enriched_questions()
-    print(f"enriched questions: {len(enriched)} loaded ({ENRICHED_QUESTIONS_FILE})")
-    enriched_vecs = embed_enriched_questions(enriched, model_name=args.embed_model,
-                                             batch_size=args.embed_batch_size, force=args.force)
-    add_questions_to_db(collection, enriched, enriched_vecs)
-
-    # routing: OPENAI_BASE_URL forces the openai/ route to that endpoint,
-    # whatever the model id looks like (TF ids contain "/")
-    model, kwargs = args.model, {}
-    base = os.getenv("OPENAI_BASE_URL")
-    if base:
-        kwargs["api_base"] = base
-        model = f"openai/{model.removeprefix('openai/')}"
-    elif "/" not in model:
-        model = f"openai/{model}"
+    system = _finish_build(chunks, args.model, args.system_prompt, args.embed_model,
+                           args.embed_batch_size, args.top_k, args.expand, args.force)
 
     questions = json.load(open(args.questions, encoding="utf-8"))
     if isinstance(questions, dict):  # staff sets wrap the list in {"questions": [...]}
@@ -596,20 +715,10 @@ def main():
     with open(args.out, "w", encoding="utf-8") as out:
         for q, q_vec in zip(questions, q_vecs):
             t0 = time.time()
-            hits = query_top_k(collection, q_vec, k=args.top_k, expand=args.expand)
-            resp = litellm.completion(model=model, messages=[
-                {"role": "system", "content": args.system_prompt},
-                {"role": "user", "content": build_rag_prompt(q["question"], hits)}],
-                timeout=120, **kwargs)
-            answer, citations = extract_citations(resp.choices[0].message.content, hits)
+            hits = system.retrieve(q_vec)  # q_vec is the disk-cached batch embedding
+            answer, citations, resp = system.generate(q["question"], hits)
             rec = {"id": q["id"],
-                   "answer": answer,
-                   "citations": citations,
-                   "retrieved": [{"file": h["file"], "page": h["page"],
-                                  "score": round(h["score"], 3)} for h in hits],
-                   "latency_ms": (time.time() - t0) * 1000,
-                   "tokens": {"prompt": resp.usage.prompt_tokens,
-                              "completion": resp.usage.completion_tokens}}
+                   **_answer_record(answer, citations, hits, resp, (time.time() - t0) * 1000)}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print(f"{q['id']}: {rec['answer'][:70]!r}... ({rec['latency_ms']:.0f} ms; "
                   f"top hit {hits[0]['file']} p{hits[0]['page']} @{hits[0]['score']:.2f})")
