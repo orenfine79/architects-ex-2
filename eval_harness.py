@@ -57,7 +57,7 @@ Example:
 {"reasoning": "Covers all key facts with no contradictions.", "similarity_score": 5, "is_refusal": false, "is_hallucination": false}
 """
 
-MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+MODEL = "google/gemma-3-27b-it"
 
 PARSED_DIR = Path("parsed_corpus")
 

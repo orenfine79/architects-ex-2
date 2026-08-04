@@ -26,7 +26,7 @@ export OPENAI_BASE_URL=https://api.tokenfactory.nebius.com/v1
 export OPENAI_API_KEY=$NEBIUS_API_KEY
 
 # Stage 1: baseline answers, then score them with YOUR harness
-python baseline_runner.py --model deepseek-ai/DeepSeek-V4-Pro
+python baseline_runner.py --model google/gemma-3-27b-it
 ```
 
 The document corpus: `python get_corpus.py` downloads the frozen snapshot

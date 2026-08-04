@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tf_client import chat
 
-MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+MODEL = "google/gemma-3-27b-it"
 N_QUESTIONS = 10
 
 EXAMPLE_QUESTIONS = """

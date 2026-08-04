@@ -4,7 +4,7 @@ NO retrieval, producing an answers file the eval harness can score.
 
     export OPENAI_API_KEY=...  # paste in nebius API key
     export OPENAI_BASE_URL=https://api.tokenfactory.nebius.com/v1  # Use token factory
-    python baseline_runner.py --model deepseek-ai/DeepSeek-V4-Pro
+    python baseline_runner.py --model google/gemma-3-27b-it
     # then score baseline_answers.jsonl with YOUR evaluation harness (Stage 1)
 
 Calls go through litellm: a bare model name goes to OpenAI; set
@@ -26,7 +26,7 @@ from eval_harness import run_evaluation
 # Loads the variables from .env into the environment
 load_dotenv() 
 
-MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+MODEL = "google/gemma-3-27b-it"
 
 # V1 
 V1_SYSTEM = """

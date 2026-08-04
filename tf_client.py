@@ -4,7 +4,7 @@ balance -- play fair: watch the cost estimate this prints and don't burn the
 pool. Set NEBIUS_API_KEY, then:
 
     from tf_client import chat
-    reply = chat([{"role": "user", "content": "..."}], model="deepseek-ai/DeepSeek-V4-Pro")
+    reply = chat([{"role": "user", "content": "..."}], model="google/gemma-3-27b-it")
 
     python tf_client.py --model Qwen/Qwen3-32B "מה מכסה ביטוח דירה?"
 """
@@ -43,6 +43,6 @@ def chat(messages, model, max_tokens=1024, temperature=0.2, quiet=False, **kw):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt")
-    ap.add_argument("--model", default="deepseek-ai/DeepSeek-V4-Pro")
+    ap.add_argument("--model", default="google/gemma-3-27b-it")
     args = ap.parse_args()
     print(chat([{"role": "user", "content": args.prompt}], model=args.model))
